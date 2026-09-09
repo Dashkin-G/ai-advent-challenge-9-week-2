@@ -12,11 +12,18 @@
 Важная особенность: вызов модели блокирующий, а перерисовывает окно главный поток.
 Поэтому обращение к агенту уходит в отдельный QThread, а результат возвращается
 сигналом.
+
+При запуске окно не создаёт агентов само: их поднимает `load_agents()` из
+хранилища, поэтому после перезапуска на экране оказывается тот же агент с тем же
+разговором. Про формат хранения окно по-прежнему ничего не знает — только про то,
+что состояние где-то есть.
 """
 import json
 import logging
 import re
 import sys
+import time
+from pathlib import Path
 
 from PySide6.QtCore import QEvent, QSettings, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QKeySequence, QPalette, QShortcut
@@ -27,7 +34,8 @@ from PySide6.QtWidgets import (
 )
 
 from . import config
-from .agent import DEFAULT_PROFILE, Agent, AgentError, AgentProfile, AgentReply
+from .agent import DEFAULT_PROFILE, Agent, AgentError, AgentProfile, AgentReply, load_agents
+from .store import Store
 
 # В окне нужен диалог, а не логи вызовов — оставляем только предупреждения.
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s [%(name)s] %(message)s")
@@ -347,8 +355,12 @@ class ChatView(QScrollArea):
     def clear(self) -> None:
         while self.lay.count() > 1:
             item = self.lay.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+            widget = item.widget()
+            if widget is not None:
+                # setParent(None) убирает строку из ленты сразу: одного deleteLater
+                # мало — до следующего прохода цикла событий старые пузыри живы.
+                widget.setParent(None)
+                widget.deleteLater()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -398,28 +410,44 @@ class RawDialog(QDialog):
 
 
 class MemoryDialog(QDialog):
-    """Память агента: то, что он подставит в следующий запрос."""
+    """История агента целиком и граница окна контекста внутри неё.
+
+    Первая вкладка — переписка как диалог: выше границы то, что хранится, ниже —
+    то, что реально уйдёт в модель следующим запросом. Вторая — те же сообщения
+    строками таблицы `messages`, чтобы было видно, что история лежит в базе.
+    """
 
     def __init__(self, agent: Agent, parent: QWidget) -> None:
         super().__init__(parent)
-        self.setWindowTitle(f"Память агента «{agent.profile.name}»")
+        self.setWindowTitle(f"Память и история агента «{agent.profile.name}»")
         self.resize(680, 560)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(16, 16, 16, 16)
 
-        memory = agent.memory
+        p = agent.passport()
+        history = agent.transcript()
         head = QLabel(
-            f"{len(memory)} сообщ. — агент подставит их в следующий запрос"
-            if memory else "Память пуста — агент ещё ничего не запомнил."
+            f"{len(history)} сообщ. в истории · {p['memory_messages']} уйдёт в модель · "
+            f"{p['history_file'] or 'история не ведётся'}"
+            if history else "История пуста — агент ещё ничего не запомнил."
         )
         head.setObjectName("note")
+        head.setWordWrap(True)
         lay.addWidget(head)
 
         chat = ChatView(bubble_max=480)
-        for m in memory:
+        # Граница контекста: всё, что выше, хранится, но в запрос уже не попадёт.
+        edge = len(history) - p["memory_messages"]
+        for number, m in enumerate(history):
+            if number == edge and edge > 0:
+                chat.add_system(f"↓ последние {p['memory_messages']} сообщ. — это и есть контекст модели")
             chat.add_bubble(m["content"], "user" if m["role"] == "user" else "agent")
         chat.to_top()
-        lay.addWidget(chat)
+
+        tabs = QTabWidget()
+        tabs.addTab(chat, "Диалог")
+        tabs.addTab(_history_table(agent.id, history), "В базе")
+        lay.addWidget(tabs)
 
 
 class AgentItem(QFrame):
@@ -436,7 +464,7 @@ class AgentItem(QFrame):
         self.setToolTip(
             f"{agent.profile.name} — {agent.profile.role}\n"
             f"{config.model_label(agent.model)} · обращений: {agent.turns} · "
-            f"в памяти: {len(agent.memory)} сообщ."
+            f"в памяти: {len(agent.memory)} сообщ. · в истории: {agent.history_size} сообщ."
         )
         lay = QHBoxLayout(self)
         lay.setContentsMargins(12, 6, 8, 7)
@@ -463,71 +491,101 @@ class AgentItem(QFrame):
         super().mousePressEvent(event)
 
 
-class NewAgentDialog(QDialog):
-    """Новый агент: имя, заготовка профиля, инструкция и модель."""
+class ProfileDialog(QDialog):
+    """Паспорт агента: имя, подпись роли, инструкция и модель.
 
-    def __init__(self, parent: QWidget) -> None:
+    Одно окно на два случая — завести нового агента и поправить профиль
+    существующего. Поля те же, меняются заголовок и кнопка; при правке заготовки
+    и выбор модели не показываются (модель меняется в боковой панели, а заготовка
+    затёрла бы то, что уже написано).
+    """
+
+    def __init__(self, parent: QWidget, agent: Agent | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Новый агент")
-        self.resize(560, 460)
+        self.agent = agent
+        self.setWindowTitle("Новый агент" if agent is None else "Профиль агента")
+        self.resize(560, 500)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(16, 16, 16, 16)
         lay.setSpacing(10)
 
-        note = QLabel("У каждого агента своя роль, своя память и свои настройки.")
+        note = QLabel(
+            "У каждого агента своя роль, своя память и свои настройки."
+            if agent is None else
+            "Имя, подпись и инструкция. Память и история агента останутся при нём."
+        )
         note.setObjectName("note")
+        note.setWordWrap(True)
         lay.addWidget(note)
 
-        lay.addWidget(_section("ЗАГОТОВКА ПРОФИЛЯ"))
         self.preset = QComboBox()
-        for profile in config.PROFILE_PRESETS:
-            self.preset.addItem(f"{profile['name']} — {profile['role']}", profile)
-        self.preset.currentIndexChanged.connect(self._fill_from_preset)
-        lay.addWidget(self.preset)
+        if agent is None:
+            lay.addWidget(_section("ЗАГОТОВКА ПРОФИЛЯ"))
+            for profile in config.PROFILE_PRESETS:
+                title = profile.get("title") or f"{profile['name']} — {profile['role']}"
+                self.preset.addItem(title, profile)
+            self.preset.currentIndexChanged.connect(self._fill_from_preset)
+            lay.addWidget(self.preset)
 
         lay.addWidget(_section("ИМЯ"))
         self.name = QLineEdit()
         self.name.setMaxLength(40)
+        self.name.setPlaceholderText("Как зовут агента — видно на вкладке")
         lay.addWidget(self.name)
 
-        lay.addWidget(_section("ИНСТРУКЦИЯ (РОЛЬ)"))
+        lay.addWidget(_section("ПОДПИСЬ: ЧЕМ ЗАНИМАЕТСЯ"))
+        self.role = QLineEdit()
+        self.role.setMaxLength(60)
+        self.role.setPlaceholderText("Короткая подпись под именем, например «лидер автоботов»")
+        lay.addWidget(self.role)
+
+        lay.addWidget(_section("ИНСТРУКЦИЯ (ХАРАКТЕР И ПРАВИЛА)"))
         self.instructions = QPlainTextEdit()
         self.instructions.setPlaceholderText("Пусто — возьмётся инструкция агента по умолчанию")
         lay.addWidget(self.instructions, 1)
 
-        lay.addWidget(_section("МОДЕЛЬ"))
         self.model = QComboBox()
-        for item in config.MODELS:
-            self.model.addItem(item["label"], item["code"])
-        self.model.setCurrentIndex(max(0, self.model.findData(config.DEFAULT_MODEL)))
-        lay.addWidget(self.model)
+        if agent is None:
+            lay.addWidget(_section("МОДЕЛЬ"))
+            for item in config.MODELS:
+                self.model.addItem(item["label"], item["code"])
+            self.model.setCurrentIndex(max(0, self.model.findData(config.DEFAULT_MODEL)))
+            lay.addWidget(self.model)
 
         buttons = QHBoxLayout()
         buttons.setSpacing(10)
-        create = QPushButton("Создать")
-        create.setObjectName("send")
-        create.setFixedHeight(40)
-        create.setCursor(Qt.PointingHandCursor)
-        create.clicked.connect(self.accept)
+        apply_btn = QPushButton("Создать" if agent is None else "Сохранить")
+        apply_btn.setObjectName("send")
+        apply_btn.setFixedHeight(40)
+        apply_btn.setCursor(Qt.PointingHandCursor)
+        apply_btn.clicked.connect(self.accept)
         cancel = _ghost("Отмена")
         cancel.clicked.connect(self.reject)
         buttons.addWidget(cancel)
-        buttons.addWidget(create, 1)
+        buttons.addWidget(apply_btn, 1)
         lay.addLayout(buttons)
 
-        self._fill_from_preset()
+        if agent is None:
+            self._fill_from_preset()
+        else:
+            self.name.setText(agent.profile.name)
+            self.role.setText(agent.profile.role)
+            self.instructions.setPlainText(agent.profile.instructions)
+        self.name.setFocus()
 
     def _fill_from_preset(self) -> None:
+        """Подставить заготовку. «Свой профиль» — пустые поля, пишем сами."""
         profile = self.preset.currentData()
         self.name.setText(profile["name"])
+        self.role.setText(profile["role"])
         self.instructions.setPlainText(profile["instructions"])
 
     def values(self) -> dict:
         return {
             "name": self.name.text().strip() or "Агент",
-            "role": self.preset.currentData()["role"],
+            "role": self.role.text().strip() or "агент со своей памятью",
             "instructions": self.instructions.toPlainText().strip(),
-            "model": self.model.currentData(),
+            "model": self.model.currentData() or config.DEFAULT_MODEL,
         }
 
 
@@ -577,8 +635,10 @@ class AgentWindow(QMainWindow):
         super().__init__()
         self.settings = QSettings("AI Advent", "Agent")   # масштаб переживает перезапуск
         self.scale = float(self.settings.value("ui/scale", 1.0))
-        self.agents: list[Agent] = [Agent()]
-        self.agent = self.agents[0]
+        # Агенты приезжают из хранилища вместе с памятью и настройками: окно их
+        # не собирает и не знает, что и в каком виде лежит на диске.
+        self.store = Store()
+        self.agents, self.agent = load_agents(self.store)
         self.busy = False
         self.worker: AskWorker | None = None
         self._pending: Bubble | None = None
@@ -605,6 +665,7 @@ class AgentWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+0"), self, activated=lambda: self._set_scale(1.0))
 
         self._refresh()
+        self._show_transcript()  # разговор продолжается с того места, где закончился
         self.input.setFocus()
 
     # ------------------------------------------------------------ сборка окна --
@@ -659,6 +720,14 @@ class AgentWindow(QMainWindow):
         who.addWidget(self.role_label)
         who.addWidget(self.id_label)
         card_lay.addLayout(who, 1)
+
+        # Паспорт можно поправить, не заводя нового агента: память при нём останется.
+        edit = QPushButton("изменить")
+        edit.setObjectName("link")
+        edit.setCursor(Qt.PointingHandCursor)
+        edit.setToolTip("Имя, подпись и инструкция агента")
+        edit.clicked.connect(self._edit_profile)
+        card_lay.addWidget(edit, 0, Qt.AlignTop)
         lay.addWidget(card)
 
         lay.addWidget(_section("МОДЕЛЬ"))
@@ -715,25 +784,28 @@ class AgentWindow(QMainWindow):
         lay.addStretch(1)
 
         stats = QHBoxLayout()
-        stats.setSpacing(10)
+        stats.setSpacing(8)
         self.turns_stat, turns_card = _stat("обращений")
         self.mem_stat, mem_card = _stat("в памяти")
+        self.hist_stat, hist_card = _stat("в истории")
         stats.addWidget(turns_card)
         stats.addWidget(mem_card)
+        stats.addWidget(hist_card)
         lay.addLayout(stats)
 
-        memory_btn = _ghost("Память агента")
+        memory_btn = _ghost("Память и история")
         memory_btn.clicked.connect(lambda: MemoryDialog(self.agent, self).exec())
         lay.addWidget(memory_btn)
 
-        reset_btn = _ghost("Сбросить память")
+        reset_btn = _ghost("Забыть разговор")
+        reset_btn.setToolTip("Очистит и память агента, и его историю на диске")
         reset_btn.clicked.connect(self._reset)
         lay.addWidget(reset_btn)
 
-        note = QLabel("Память живёт внутри агента, а не в окне: интерфейс присылает только новое сообщение.")
-        note.setObjectName("note")
-        note.setWordWrap(True)
-        lay.addWidget(note)
+        self.storage_note = QLabel()
+        self.storage_note.setObjectName("note")
+        self.storage_note.setWordWrap(True)
+        lay.addWidget(self.storage_note)
         return panel
 
     def _build_main(self) -> QWidget:
@@ -781,6 +853,10 @@ class AgentWindow(QMainWindow):
         self.title = QLabel()
         self.title.setObjectName("title")
         titles.addWidget(self.title)
+        # Строка про историю: видно, что разговор не начинается заново каждый запуск.
+        self.subtitle = QLabel()
+        self.subtitle.setObjectName("subtitle")
+        titles.addWidget(self.subtitle)
         head_lay.addLayout(titles, 1)
         self.dot = QLabel()
         self.dot.setFixedSize(9, 9)
@@ -806,7 +882,11 @@ class AgentWindow(QMainWindow):
             chip = QPushButton(example["title"])
             chip.setObjectName("example")
             chip.setCursor(Qt.PointingHandCursor)
-            chip.setToolTip(example["prompt"] + "\n\nинструменты: " + ", ".join(example["tools"]))
+            chip.setToolTip(
+                example["prompt"] + "\n\n"
+                + (f"инструменты: {', '.join(example['tools'])}" if example["tools"]
+                   else "без инструментов: ответ из памяти агента")
+            )
             chip.clicked.connect(lambda _, text=example["prompt"]: self._use_example(text))
             strip_lay.addWidget(chip)
         strip_lay.addStretch(1)
@@ -853,6 +933,18 @@ class AgentWindow(QMainWindow):
         self.title.setText(f"Диалог с агентом «{p['name']}»")
         self.turns_stat.setText(str(p["turns"]))
         self.mem_stat.setText(str(p["memory_messages"]))
+        self.hist_stat.setText(str(p["history_messages"]))
+
+        history_file = p["history_file"]
+        self.subtitle.setText(
+            f"история: {p['history_messages']} сообщ. на диске · последний разговор {_when(p['last_seen_at'])}"
+            if p["history_messages"] else "история пуста — разговор начинается"
+        )
+        self.storage_note.setText(
+            "Память живёт внутри агента, а не в окне, и переживает перезапуск: "
+            f"переписка и настройки пишутся в {Path(history_file).name if history_file else 'память процесса'}."
+        )
+        self.storage_note.setToolTip(history_file or "")
 
         self._loading = True
         self.model_box.setCurrentIndex(max(0, self.model_box.findData(p["model"])))
@@ -955,9 +1047,21 @@ class AgentWindow(QMainWindow):
             self.agent_list.addWidget(tab)
         self.agent_list.addStretch(1)
 
+    def _edit_profile(self) -> None:
+        """Поправить паспорт активного агента: имя, подпись, инструкцию."""
+        dialog = ProfileDialog(self, agent=self.agent)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        values = dialog.values()
+        self.agent.set_profile(
+            name=values["name"], role=values["role"], instructions=values["instructions"]
+        )
+        self.setWindowTitle(f"Агент «{self.agent.profile.name}» — AI Advent")
+        self._refresh()
+
     def _create_agent(self) -> None:
         """Завести нового агента: своё имя, своя инструкция, своя память."""
-        dialog = NewAgentDialog(self)
+        dialog = ProfileDialog(self)
         if dialog.exec() != QDialog.Accepted:
             return
         values = dialog.values()
@@ -966,7 +1070,8 @@ class AgentWindow(QMainWindow):
             role=values["role"],
             instructions=values["instructions"] or DEFAULT_PROFILE.instructions,
         )
-        agent = Agent(profile=profile, model=values["model"])
+        agent = Agent(profile=profile, model=values["model"], store=self.store)
+        agent.persist()  # новый агент попадает в историю сразу, ещё до первого вопроса
         self.agents.append(agent)
         self._select_agent(agent)
 
@@ -975,36 +1080,51 @@ class AgentWindow(QMainWindow):
         if self.busy or agent is self.agent:
             return
         self.agent = agent
+        agent.mark_active()  # следующий запуск откроет разговор именно с ним
         self.setWindowTitle(f"Агент «{agent.profile.name}» — AI Advent")
         self._refresh()
         self._show_transcript()
 
     def _delete_agent(self, agent: Agent) -> None:
-        """Удалить агента вместе с его памятью (последнего удалить нельзя)."""
+        """Удалить агента вместе с его памятью и историей (последнего удалить нельзя)."""
         if self.busy or len(self.agents) == 1:
             return
+        agent.erase()
         self.agents.remove(agent)
         if agent is self.agent:
             self.agent = self.agents[-1]
+            self.agent.mark_active()
             self._show_transcript()
         self._refresh()
 
     def _show_transcript(self) -> None:
-        """Перерисовать ленту из памяти агента: она хранится в нём, а не в окне."""
+        """Перерисовать ленту перепиской агента: она хранится в нём, а не в окне."""
         self.chat.clear()
-        memory = self.agent.memory
-        if not memory:
+        p = self.agent.passport()
+        messages = self.agent.transcript()
+        if not messages:
             self.chat.add_system(
-                f"Агент «{self.agent.profile.name}» активен. Память пуста — "
+                f"Агент «{p['name']}» активен. История пуста — "
                 "начните разговор или возьмите пример под полем ввода."
             )
             return
-        for message in memory:
+
+        for message in messages:
             self.chat.add_bubble(message["content"], "user" if message["role"] == "user" else "agent")
-        self.chat.add_system(
-            f"Показана память агента «{self.agent.profile.name}» "
-            f"({len(memory)} сообщ.) — она хранится в самом агенте."
-        )
+
+        when = _when(p["last_seen_at"])
+        if p["restored"]:
+            self.chat.add_system(
+                f"Разговор восстановлен из истории: {len(messages)} сообщ., "
+                f"последний раз говорили {when}. Агент продолжает с того же места — "
+                f"в модель уйдут последние {p['memory_messages']} сообщ. (глубина памяти "
+                f"{_plural(p['memory_turns'], 'пара', 'пары', 'пар')})."
+            )
+        else:
+            self.chat.add_system(
+                f"Показана переписка агента «{p['name']}» ({len(messages)} сообщ.) — "
+                "она хранится в самом агенте и пишется в историю."
+            )
 
     def _use_example(self, text: str) -> None:
         self.input.setPlainText(text)
@@ -1101,7 +1221,10 @@ class AgentWindow(QMainWindow):
     def _reset(self) -> None:
         self.agent.reset()
         self.chat.clear()
-        self.chat.add_system("Память агента очищена — он снова не знает, о чём был разговор.")
+        self.chat.add_system(
+            "Память агента очищена, история на диске стёрта — он снова не знает, "
+            "о чём был разговор, и не вспомнит его после перезапуска."
+        )
         self._refresh()
 
     def apply_saved_scale(self) -> None:
@@ -1120,6 +1243,60 @@ def _trace_label(text: str) -> QLabel:
     label = QLabel(text)
     label.setObjectName("traceLabel")
     return label
+
+
+def _history_table(agent_id: str, history: list[dict]) -> QPlainTextEdit:
+    """Сообщения так, как они лежат в базе: строка таблицы — строка текста.
+
+    Базу не откроешь блокнотом, поэтому её содержимое показываем прямо в окне:
+    видно, что каждое сообщение — отдельная запись со своим номером и временем.
+    """
+    lines = [
+        "sqlite> SELECT id, role, at, content FROM messages",
+        f"        WHERE agent_id = '{agent_id}' ORDER BY id;",
+        "",
+        f"{'id':>5}  {'role':<9}  {'at':<15}  content",
+        f"{'-' * 5}  {'-' * 9}  {'-' * 15}  {'-' * 40}",
+    ]
+    for message in history:
+        when = time.strftime("%d.%m %H:%M:%S", time.localtime(message.get("at") or 0))
+        text = " ".join((message.get("content") or "").split())
+        if len(text) > 96:
+            text = text[:96] + "…"
+        lines.append(f"{message.get('id', '—'):>5}  {message['role']:<9}  {when:<15}  {text}")
+    if not history:
+        lines.append("-- строк нет")
+
+    view = QPlainTextEdit("\n".join(lines))
+    view.setObjectName("raw")
+    view.setReadOnly(True)
+    view.setLineWrapMode(QPlainTextEdit.NoWrap)
+    return view
+
+
+def _plural(count: int, one: str, few: str, many: str) -> str:
+    """Число с существительным в нужном падеже: 1 пара, 3 пары, 10 пар."""
+    tail, tens = count % 10, count % 100
+    if tail == 1 and tens != 11:
+        word = one
+    elif 2 <= tail <= 4 and not 12 <= tens <= 14:
+        word = few
+    else:
+        word = many
+    return f"{count} {word}"
+
+
+def _when(moment: float | None) -> str:
+    """Когда это было, по-человечески: «сегодня в 21:14», «вчера в 9:05», «06.09 в 18:30»."""
+    if not moment:
+        return "ещё не говорили"
+    day = time.localtime(moment)
+    today = time.localtime()
+    delta = time.mktime((today.tm_year, today.tm_mon, today.tm_mday, 0, 0, 0, 0, 0, -1)) - \
+        time.mktime((day.tm_year, day.tm_mon, day.tm_mday, 0, 0, 0, 0, 0, -1))
+    days = round(delta / 86400)
+    when = {0: "сегодня", 1: "вчера"}.get(days, time.strftime("%d.%m", day))
+    return f"{when} в {time.strftime('%H:%M', day)}"
 
 
 def _clip(text: str, limit: int) -> str:

@@ -13,16 +13,23 @@
        Инструмент исполняет агент, результат возвращается в диалог, цикл идёт
        дальше — до финального ответа или до потолка шагов
     4. разбор ответа
-    5. запись в память (только вопрос и итоговый ответ, без служебной переписки)
+    5. запись в память и в историю на диске (только вопрос и итоговый ответ,
+       без служебной переписки с инструментами)
 
 Именно шаг 3 отличает агента от чата: одна фраза пользователя разворачивается в
 последовательность действий, которые агент выбирает и выполняет сам.
 
+Память двухуровневая. В `_memory` живёт окно контекста — последние `memory_turns`
+пар «вопрос-ответ», ровно то, что уходит в модель. Полная переписка вместе с
+паспортом и настройками пишется в хранилище (`store.py`), поэтому агент не
+начинает с нуля после перезапуска приложения: `load_agents()` поднимает тех же
+агентов с их историей, и разговор продолжается так, будто его не прерывали.
+
 Всё вокруг агента намеренно «глупое»: `llm.py` умеет только сходить в HTTP API
-модели, `tools.py` — только выполнить работу, а интерфейс — только показать ввод,
-вывод и трассу шагов. Ни один из них не знает, как формируется запрос и что
-происходит с ответом, поэтому агента можно поднять в любом окружении: окне,
-консоли, сервере или тесте.
+модели, `tools.py` — только выполнить работу, `store.py` — только положить
+состояние на диск, а интерфейс — только показать ввод, вывод и трассу шагов. Ни
+один из них не знает, как формируется запрос и что происходит с ответом, поэтому
+агента можно поднять в любом окружении: окне, консоли, сервере или тесте.
 """
 import json
 import logging
@@ -31,6 +38,7 @@ import uuid
 from dataclasses import dataclass, field
 
 from . import config, llm, tools
+from .store import Store
 
 logger = logging.getLogger("app.agent")
 
@@ -78,12 +86,33 @@ TOOLS_NOTE = (
     "сделал."
 )
 
+# Про память модели надо сказать прямо. Переписка уходит в запрос, но роль агента
+# пишет пользователь, и без этой заметки модель отвечает выученным «я не помню
+# прошлые разговоры» — хотя весь разговор лежит у неё же в контексте.
+MEMORY_NOTE = (
+    "\n\nДальше в этом диалоге идёт твоя память: {count} сообщ. прошлого разговора "
+    "(последнее — {when}). Память хранится на диске и восстанавливается при запуске "
+    "приложения, так что разговор продолжается, даже если его прерывали. Ты "
+    "действительно помнишь всё, что в ней есть: спросят, о чём говорили раньше — "
+    "отвечай по этой переписке и никогда не заявляй, что не помнишь прошлые разговоры "
+    "или что каждый диалог начинается с чистого листа."
+)
+
+# Начало разговора: памяти нет, и придумывать «прошлые беседы» тоже нельзя.
+NO_MEMORY_NOTE = (
+    "\n\nЭто начало разговора: прошлых сообщений в памяти нет. Если спросят, о чём "
+    "говорили раньше, честно скажи, что разговор только начался."
+)
+
 PLANNER_SYSTEM = (
     "Ты — планировщик агента. По задаче пользователя реши, нужен ли план действий.\n"
     "Инструменты, доступные исполнителю:\n{tools}\n\n"
     "Если задача решается одним ответом без действий (вопрос, объяснение, беседа) — "
     "верни пустой список шагов. Если нужны действия — 2–5 коротких шагов в "
     "повелительном наклонении, каждый шаг — одно действие, по-русски.\n"
+    "У исполнителя есть память прошлого разговора, ты её не видишь: вопросы вроде "
+    "«о чём мы говорили раньше» он решает сам, без действий — на них возвращай "
+    "пустой список шагов.\n"
     'Верни СТРОГО JSON без пояснений и markdown: {{"steps": ["...", "..."]}}'
 )
 
@@ -196,6 +225,10 @@ class Agent:
     Память диалога хранится здесь, в самом агенте: интерфейс присылает только
     очередное сообщение, а контекст для модели агент собирает сам. Агентов может
     быть несколько — они независимы, память одного не видна другому.
+
+    Если агенту дали хранилище (`store`), он сам записывает туда каждое обращение
+    и каждую смену настроек — и переживает перезапуск приложения. Без хранилища
+    агент полностью работоспособен, просто помнит разговор только до закрытия.
     """
     profile: AgentProfile = DEFAULT_PROFILE
     model: str = config.DEFAULT_MODEL
@@ -209,6 +242,8 @@ class Agent:
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     created_at: float = field(default_factory=time.time)
     turns: int = 0                                # сколько запросов агент обработал
+    store: Store | None = field(default=None, repr=False)   # куда класть состояние
+    restored: bool = False                        # поднят из истории, а не создан заново
     _memory: list[dict] = field(default_factory=list, repr=False)
 
     # ------------------------------------------------------------------- вход --
@@ -246,8 +281,8 @@ class Agent:
             raw = totals.add(self._call(messages, None))
 
         answer = self._postprocess(raw["content"], steps)   # 4. разбор ответа
-        self._remember(text, answer)                        # 5. память
         self.turns += 1
+        self._remember(text, answer)                        # 5. память и история
 
         elapsed = time.perf_counter() - started
         logger.info(
@@ -336,11 +371,19 @@ class Agent:
         )
 
     def _system_prompt(self, plan: list[str]) -> str:
-        """Роль агента, дополненная правилами про инструменты и собственным планом."""
+        """Роль агента, дополненная правилами про инструменты, память и план.
+
+        Роль пишет пользователь, и полагаться на неё в этих вопросах нельзя: про
+        инструменты и про собственную память агент рассказывает модели сам.
+        """
         prompt = self.profile.instructions
         if self.tools_enabled:
             prompt += TOOLS_NOTE
             prompt += f"\n\nРабочая папка для файловых инструментов: {tools.workspace()}"
+        if self._memory:
+            prompt += MEMORY_NOTE.format(count=len(self._memory), when=self._last_seen())
+        else:
+            prompt += NO_MEMORY_NOTE
         if plan:
             listed = "\n".join(f"{i}. {step}" for i, step in enumerate(plan, 1))
             prompt += (
@@ -418,21 +461,46 @@ class Agent:
         )
 
     def _remember(self, question: str, answer: str) -> None:
-        """Шаг 5. Запомнить обмен и подрезать память до последних пар сообщений.
+        """Шаг 5. Запомнить обмен: в окно контекста и в историю на диске.
 
         В памяти держим только вопрос и итоговый ответ: служебная переписка с
         инструментами нужна внутри одного обращения, а в долгой памяти она бы
         быстро съела контекст и деньги.
+
+        В хранилище уходит та же пара плюс обновлённое состояние агента — одной
+        записью, чтобы история и счётчик обращений не разъезжались.
         """
-        self._memory.append({"role": "user", "content": question})
-        self._memory.append({"role": "assistant", "content": answer})
+        pair = [
+            {"role": "user", "content": question},
+            {"role": "assistant", "content": answer},
+        ]
+        self._memory.extend(pair)
         self._trim_memory()
+        if self.store is not None:
+            self.store.save_turn(self.state(), pair)
 
     def _trim_memory(self) -> None:
         """Оставить в памяти только последние `memory_turns` пар «вопрос-ответ»."""
         limit = max(0, self.memory_turns) * 2
         if len(self._memory) > limit:
             del self._memory[: len(self._memory) - limit]
+
+    def _load_memory(self) -> None:
+        """Собрать окно контекста из истории: последние `memory_turns` пар.
+
+        Вызывается при восстановлении агента и при смене глубины памяти —
+        увеличили глубину, и агент дотягивает из истории то, что уже забыл.
+        """
+        if self.store is None:
+            self._trim_memory()
+            return
+        history = self.store.messages(self.id, limit=max(0, self.memory_turns) * 2)
+        self._memory = [{"role": m["role"], "content": m["content"]} for m in history]
+
+    def _last_seen(self) -> str:
+        """Когда в памяти появилось последнее сообщение — для заметки модели."""
+        moment = self.store.last_at(self.id) if self.store is not None else None
+        return time.strftime("%d.%m.%Y %H:%M", time.localtime(moment)) if moment else "недавно"
 
     # ------------------------------------------------------------ управление им --
 
@@ -464,7 +532,7 @@ class Agent:
             if not 0 <= memory_turns <= 50:
                 raise AgentError("Глубина памяти должна быть от 0 до 50 пар сообщений.")
             self.memory_turns = int(memory_turns)
-            self._trim_memory()
+            self._load_memory()  # глубину увеличили — доберём забытое из истории
         if tools_enabled is not None:
             self.tools_enabled = bool(tools_enabled)
         if planning is not None:
@@ -478,12 +546,125 @@ class Agent:
             self.profile.name, self.id, self.model, self.temperature, self.memory_turns,
             self.tools_enabled, self.planning, self.max_steps,
         )
+        self.persist()  # настройки тоже переживают перезапуск
+
+    def set_profile(
+        self,
+        name: str | None = None,
+        role: str | None = None,
+        instructions: str | None = None,
+    ) -> None:
+        """Сменить паспорт: имя, подпись роли и system-инструкцию.
+
+        Память и история остаются — это тот же агент, просто теперь он ведёт себя
+        иначе. Пустое поле означает «оставить как было», пустая инструкция —
+        вернуться к инструкции по умолчанию.
+        """
+        current = self.profile
+        self.profile = AgentProfile(
+            name=(name if name is not None else current.name).strip()[:40] or current.name,
+            role=(role if role is not None else current.role).strip() or current.role,
+            instructions=(instructions if instructions is not None else current.instructions).strip()
+            or DEFAULT_PROFILE.instructions,
+        )
+        self.persist()
+        logger.info("Агент [%s]: паспорт обновлён — «%s», %s", self.id, self.profile.name, self.profile.role)
 
     def reset(self) -> None:
-        """Забыть диалог. Паспорт и настройки остаются — агент тот же самый."""
+        """Забыть диалог — и в памяти, и в истории на диске.
+
+        Паспорт и настройки остаются: агент тот же самый, просто без прошлого.
+        Стирать историю здесь важно, иначе после перезапуска забытое вернулось бы.
+        """
         self._memory.clear()
         self.turns = 0
-        logger.info("Агент «%s» [%s]: память очищена", self.profile.name, self.id)
+        if self.store is not None:
+            self.store.forget(self.id)
+        self.persist()
+        logger.info("Агент «%s» [%s]: память и история очищены", self.profile.name, self.id)
+
+    # ------------------------------------------------- состояние между запусками --
+
+    def state(self) -> dict:
+        """Всё, чем агент является, кроме переписки: её ведёт сама история.
+
+        Это то, что уходит в хранилище. Обратная операция — `restore()`.
+        """
+        return {
+            "id": self.id,
+            "created_at": self.created_at,
+            "turns": self.turns,
+            "profile": {
+                "name": self.profile.name,
+                "role": self.profile.role,
+                "instructions": self.profile.instructions,
+            },
+            "settings": {
+                "model": self.model,
+                "temperature": self.temperature,
+                "max_tokens": self.max_tokens,
+                "memory_turns": self.memory_turns,
+                "tools_enabled": self.tools_enabled,
+                "planning": self.planning,
+                "max_steps": self.max_steps,
+            },
+        }
+
+    @classmethod
+    def restore(cls, state: dict, store: Store) -> "Agent":
+        """Поднять агента из сохранённого состояния вместе с его памятью.
+
+        К значениям из файла относимся как к чужим: чего нет — берём по
+        умолчанию, модель вне безопасного реестра меняем на модель по умолчанию.
+        Приложение должно запускаться даже с устаревшим или правленым файлом.
+        """
+        profile = state.get("profile") or {}
+        settings = state.get("settings") or {}
+        model = settings.get("model", config.DEFAULT_MODEL)
+        if not config.is_allowed_model(model):
+            logger.warning("В истории модель «%s» вне реестра — берём %s", model, config.DEFAULT_MODEL)
+            model = config.DEFAULT_MODEL
+
+        agent = cls(
+            profile=AgentProfile(
+                name=profile.get("name") or DEFAULT_PROFILE.name,
+                role=profile.get("role") or DEFAULT_PROFILE.role,
+                instructions=profile.get("instructions") or DEFAULT_PROFILE.instructions,
+            ),
+            model=model,
+            temperature=float(settings.get("temperature", config.AGENT_TEMPERATURE)),
+            max_tokens=settings.get("max_tokens", config.AGENT_MAX_TOKENS),
+            memory_turns=int(settings.get("memory_turns", config.AGENT_MEMORY_TURNS)),
+            tools_enabled=bool(settings.get("tools_enabled", config.AGENT_TOOLS)),
+            planning=bool(settings.get("planning", config.AGENT_PLANNING)),
+            max_steps=int(settings.get("max_steps", config.AGENT_MAX_STEPS)),
+            id=state.get("id") or uuid.uuid4().hex[:8],
+            created_at=float(state.get("created_at") or time.time()),
+            turns=int(state.get("turns") or 0),
+            store=store,
+            restored=True,
+        )
+        agent._load_memory()
+        logger.info(
+            "Агент «%s» [%s] восстановлен: %d обращений, %d сообщ. в памяти из %d в истории",
+            agent.profile.name, agent.id, agent.turns, len(agent._memory), agent.history_size,
+        )
+        return agent
+
+    def persist(self) -> None:
+        """Записать состояние агента в хранилище (без хранилища — ничего не делаем)."""
+        if self.store is not None:
+            self.store.save_agent(self.state())
+
+    def mark_active(self) -> None:
+        """Запомнить, что разговор идёт с этим агентом: его и откроет следующий запуск."""
+        if self.store is not None:
+            self.store.set_active(self.id)
+
+    def erase(self) -> None:
+        """Убрать агента из хранилища: после перезапуска его не будет."""
+        if self.store is not None:
+            self.store.remove_agent(self.id)
 
     # --------------------------------------------------------- для интерфейса --
 
@@ -491,6 +672,21 @@ class Agent:
     def memory(self) -> list[dict]:
         """Копия памяти: интерфейс её показывает, но менять не может."""
         return [dict(m) for m in self._memory]
+
+    @property
+    def history_size(self) -> int:
+        """Сколько сообщений агента лежит в истории (в памяти — обычно меньше)."""
+        return self.store.count(self.id) if self.store is not None else len(self._memory)
+
+    def transcript(self) -> list[dict]:
+        """Вся переписка агента: из истории, если она есть, иначе из памяти.
+
+        Интерфейс рисует ленту именно отсюда, поэтому после перезапуска на экране
+        оказывается весь прошлый разговор, а не только то, что уйдёт в модель.
+        """
+        if self.store is not None:
+            return self.store.messages(self.id)
+        return self.memory
 
     def passport(self) -> dict:
         """Всё состояние агента одним словарём — то, что рисует интерфейс."""
@@ -514,7 +710,33 @@ class Agent:
             "max_steps": self.max_steps,
             "tools": tools.catalog(),
             "workspace": str(tools.workspace()),
+            # Память между запусками: сколько сохранено, где лежит и когда говорили
+            "history_messages": self.history_size,
+            "history_file": str(self.store.path) if self.store is not None else None,
+            "last_seen_at": self.store.last_at(self.id) if self.store is not None else None,
+            "restored": self.restored,
         }
+
+
+def load_agents(store: Store | None = None) -> tuple[list[Agent], Agent]:
+    """Поднять агентов прошлого запуска и того из них, с кем шёл разговор.
+
+    Это единственное место, где решается, откуда берутся агенты при старте, —
+    интерфейсу остаётся показать готовое. Истории нет (первый запуск, стёрли файл)
+    — заводим одного агента по умолчанию и сразу закрепляем его в хранилище.
+    """
+    store = store if store is not None else Store()
+    agents = [Agent.restore(state, store) for state in store.agents()]
+    if not agents:
+        fresh = Agent(store=store)
+        fresh.persist()
+        fresh.mark_active()
+        agents = [fresh]
+        logger.info("История пуста — создан агент «%s» [%s]", fresh.profile.name, fresh.id)
+
+    active_id = store.active_id()
+    active = next((a for a in agents if a.id == active_id), agents[0])
+    return agents, active
 
 
 def _extract_json(text: str) -> dict | None:
