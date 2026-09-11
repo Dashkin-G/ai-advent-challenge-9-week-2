@@ -9,11 +9,13 @@
 хранения — правка одного этого файла, агент её не замечает.
 
 База — SQLite (`data/agents.db`), она встроена в Python, отдельный сервер и новые
-зависимости не нужны. Две таблицы:
+зависимости не нужны. Три таблицы:
 
     agents    id, created_at, turns, active + паспорт (name/role/instructions)
               и настройки (model, temperature, memory_turns, tools_enabled, …)
     messages  id, agent_id, role, content, at — по строке на сообщение
+    usage     id, agent_id, turn, at + токены, стоимость и вес контекста —
+              по строке на обращение: из неё видно, как дорожает разговор
 
 Почему база, а не файл целиком: сообщение дописывается одной строкой (INSERT), а
 не переписыванием всей истории, обращение фиксируется транзакцией (на диске либо
@@ -36,7 +38,7 @@ from . import config
 
 logger = logging.getLogger("app.store")
 
-VERSION = 1  # версия схемы, хранится в PRAGMA user_version
+VERSION = 2  # версия схемы, хранится в PRAGMA user_version
 
 # Колонки таблицы agents: отсюда собирается и CREATE TABLE, и мягкая миграция.
 # Появится новая настройка — колонка допишется в существующую базу сама; объявляй
@@ -68,6 +70,31 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS messages_by_agent ON messages(agent_id, id);
 """
+
+# Расход токенов: по строке на обращение. Отдельная таблица, а не колонки-счётчики
+# в agents, потому что интересна не только сумма, но и то, КАК она набиралась —
+# из ряда строк видно, что запрос дорожает с каждым обменом, а ответ нет.
+# Колонки объявлены словарём по тому же принципу, что и у agents: новые дописываются
+# в существующую базу через ALTER TABLE, поэтому объявляй их с DEFAULT.
+USAGE_COLUMNS = {
+    "id": "INTEGER PRIMARY KEY",
+    "agent_id": "TEXT NOT NULL",
+    "turn": "INTEGER NOT NULL DEFAULT 0",           # какое это по счёту обращение
+    "at": "REAL NOT NULL DEFAULT 0",
+    "model": "TEXT NOT NULL DEFAULT ''",
+    "prompt_tokens": "INTEGER NOT NULL DEFAULT 0",       # факт по всем вызовам обращения
+    "completion_tokens": "INTEGER NOT NULL DEFAULT 0",
+    "total_tokens": "INTEGER NOT NULL DEFAULT 0",
+    "cost_usd": "REAL",                                  # теоретическая стоимость
+    "llm_calls": "INTEGER NOT NULL DEFAULT 0",           # план + шаги + итог
+    "estimated": "INTEGER NOT NULL DEFAULT 0",           # оценка агента до отправки
+    "context_tokens": "INTEGER NOT NULL DEFAULT 0",      # сколько занял контекст запроса
+    "memory_tokens": "INTEGER NOT NULL DEFAULT 0",       # из них память диалога
+    "context_limit": "INTEGER NOT NULL DEFAULT 0",       # окно модели на тот момент
+    "trimmed_pairs": "INTEGER NOT NULL DEFAULT 0",       # сколько пар памяти выброшено
+}
+
+USAGE_INDEX = "CREATE INDEX IF NOT EXISTS usage_by_agent ON usage(agent_id, id)"
 
 
 class Store:
@@ -110,28 +137,41 @@ class Store:
         with self._connect() as conn:
             agents = conn.execute("SELECT COUNT(*) FROM agents").fetchone()[0]
             messages = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-        logger.info("Состояние: %d агент(ов), %d сообщ. · %s", agents, messages, self.path)
+            spent = conn.execute("SELECT COALESCE(SUM(total_tokens), 0) FROM usage").fetchone()[0]
+        logger.info(
+            "Состояние: %d агент(ов), %d сообщ., %d токен(ов) израсходовано · %s",
+            agents, messages, spent, self.path,
+        )
 
     def _create_schema(self) -> None:
-        columns = ", ".join(f"{name} {declaration}" for name, declaration in AGENT_COLUMNS.items())
+        agents = ", ".join(f"{name} {declaration}" for name, declaration in AGENT_COLUMNS.items())
+        usage = ", ".join(f"{name} {declaration}" for name, declaration in USAGE_COLUMNS.items())
         with self._connect() as conn:
-            conn.execute(f"CREATE TABLE IF NOT EXISTS agents ({columns})")
+            conn.execute(f"CREATE TABLE IF NOT EXISTS agents ({agents})")
             conn.executescript(MESSAGES_SCHEMA)
-            self._add_new_columns(conn)
+            # Внешний ключ дописан отдельной строкой: ALTER TABLE его добавить не
+            # умеет, а таблица целиком создаётся и в базе от прошлой версии.
+            conn.execute(
+                f"CREATE TABLE IF NOT EXISTS usage ({usage}, "
+                f"FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE)"
+            )
+            conn.execute(USAGE_INDEX)
+            self._add_new_columns(conn, "agents", AGENT_COLUMNS)
+            self._add_new_columns(conn, "usage", USAGE_COLUMNS)
             conn.execute(f"PRAGMA user_version = {VERSION}")
 
     @staticmethod
-    def _add_new_columns(conn: sqlite3.Connection) -> None:
-        """Дописать колонки, которых нет в уже существующей базе.
+    def _add_new_columns(conn: sqlite3.Connection, table: str, columns: dict) -> None:
+        """Дописать колонки, которых нет в уже существующей таблице.
 
         Так база, сделанная прошлой версией приложения, продолжает работать: новая
         настройка агента появляется колонкой, а история остаётся на месте.
         """
-        have = {row["name"] for row in conn.execute("PRAGMA table_info(agents)")}
-        for name, declaration in AGENT_COLUMNS.items():
+        have = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for name, declaration in columns.items():
             if name not in have:
-                conn.execute(f"ALTER TABLE agents ADD COLUMN {name} {declaration}")
-                logger.info("В таблицу agents добавлена колонка %s", name)
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+                logger.info("В таблицу %s добавлена колонка %s", table, name)
 
     # --------------------------------------------------------------- чтение --
 
@@ -171,6 +211,38 @@ class Store:
                 "SELECT COUNT(*) FROM messages WHERE agent_id = ?", (agent_id,)
             ).fetchone()[0]
 
+    def usage(self, agent_id: str, limit: int | None = None) -> list[dict]:
+        """Расход по обращениям агента: строка на обращение, в порядке времени."""
+        with self._connect() as conn:
+            if limit is None:
+                rows = conn.execute(
+                    "SELECT * FROM usage WHERE agent_id = ? ORDER BY id", (agent_id,)
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM (SELECT * FROM usage WHERE agent_id = ? ORDER BY id DESC "
+                    "LIMIT ?) ORDER BY id",
+                    (agent_id, max(0, limit)),
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    def usage_totals(self, agent_id: str) -> dict:
+        """Сколько агент израсходовал за всё время: токены, стоимость, вызовы модели."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS turns, "
+                "       COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens, "
+                "       COALESCE(SUM(completion_tokens), 0) AS completion_tokens, "
+                "       COALESCE(SUM(total_tokens), 0) AS total_tokens, "
+                "       SUM(cost_usd) AS cost_usd, "
+                "       COALESCE(SUM(llm_calls), 0) AS llm_calls "
+                "FROM usage WHERE agent_id = ?",
+                (agent_id,),
+            ).fetchone()
+        totals = dict(row)
+        totals["cost_usd"] = totals["cost_usd"] or 0.0
+        return totals
+
     def last_at(self, agent_id: str) -> float | None:
         """Когда агент разговаривал в последний раз (время последнего сообщения)."""
         with self._connect() as conn:
@@ -186,11 +258,18 @@ class Store:
         with self._connect() as conn:
             self._upsert(conn, state)
 
-    def save_turn(self, state: dict, messages: list[dict]) -> None:
-        """Зафиксировать обращение: сообщения и состояние агента — одной транзакцией."""
+    def save_turn(self, state: dict, messages: list[dict], usage: dict | None = None) -> None:
+        """Зафиксировать обращение: сообщения, состояние и расход — одной транзакцией.
+
+        Одной транзакцией, потому что иначе счётчик обращений, история и расход
+        токенов разъедутся: строка в `usage` без своей пары сообщений врала бы про
+        цену разговора.
+        """
         with self._connect() as conn:
             self._upsert(conn, state)
             self._append(conn, state["id"], messages)
+            if usage:
+                self._spend(conn, state["id"], usage)
 
     def set_active(self, agent_id: str) -> None:
         """Запомнить, с кем продолжать разговор при следующем запуске."""
@@ -198,9 +277,10 @@ class Store:
             conn.execute("UPDATE agents SET active = (id = ?)", (agent_id,))
 
     def forget(self, agent_id: str) -> None:
-        """Стереть переписку агента, оставив самого агента с его настройками."""
+        """Стереть переписку агента и её расход, оставив агента с его настройками."""
         with self._connect() as conn:
             conn.execute("DELETE FROM messages WHERE agent_id = ?", (agent_id,))
+            conn.execute("DELETE FROM usage WHERE agent_id = ?", (agent_id,))
         logger.info("История агента [%s] стёрта", agent_id)
 
     def remove_agent(self, agent_id: str) -> None:
@@ -243,6 +323,18 @@ class Store:
             "    SELECT id FROM messages WHERE agent_id = ? ORDER BY id DESC LIMIT ?)",
             (agent_id, agent_id, config.HISTORY_LIMIT),
         )
+
+    @staticmethod
+    def _spend(conn: sqlite3.Connection, agent_id: str, usage: dict) -> None:
+        """Записать расход обращения строкой в `usage`."""
+        # Чего в словаре нет, того нет и в запросе: за такие колонки ответит DEFAULT.
+        row = {name: usage[name] for name in USAGE_COLUMNS
+               if name in usage and name not in ("id", "agent_id", "at")}
+        row["agent_id"] = agent_id
+        row["at"] = time.time()
+        columns = ", ".join(row)
+        marks = ", ".join(f":{name}" for name in row)
+        conn.execute(f"INSERT INTO usage ({columns}) VALUES ({marks})", row)
 
 
 def _row(state: dict) -> dict:

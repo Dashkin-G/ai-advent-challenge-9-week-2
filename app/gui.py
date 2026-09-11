@@ -26,7 +26,7 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QSettings, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QKeySequence, QPalette, QShortcut
+from PySide6.QtGui import QColor, QFont, QKeySequence, QPainter, QPalette, QPen, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox,
@@ -34,7 +34,9 @@ from PySide6.QtWidgets import (
 )
 
 from . import config
-from .agent import DEFAULT_PROFILE, Agent, AgentError, AgentProfile, AgentReply, load_agents
+from .agent import (
+    DEFAULT_PROFILE, MEMORY_TURNS_MAX, Agent, AgentError, AgentProfile, AgentReply, load_agents,
+)
 from .store import Store
 
 # В окне нужен диалог, а не логи вызовов — оставляем только предупреждения.
@@ -214,7 +216,28 @@ QLineEdit {{
     padding: 8px 10px; font-size: 13px; selection-background-color: {ACCENT2};
 }}
 QLineEdit:focus {{ border-color: {ACCENT2}; }}
+
+/* Токены: полоса состава запроса, дорожка заполнения окна и диаграмма расхода */
+QFrame#contextCard {{ background: {CARD}; border: 1px solid {LINE}; border-radius: 12px; }}
+QFrame#contextCard QLabel {{ background: transparent; }}
+QFrame#barTrack {{ background: {BLACK}; border: 1px solid {LINE}; border-radius: 5px; }}
+QLabel#tokenLine {{ color: {MUTED}; font-family: Consolas, monospace; font-size: 11px; }}
+QLabel#tokenBig {{ font-family: Consolas, monospace; font-size: 13px; font-weight: 600; }}
+QFrame#chart {{ background: {PANEL}; border: 1px solid {LINE}; border-radius: 12px; }}
 """
+
+# Части запроса и их цвета: одни и те же в полосе контекста, в легенде и в окне
+# токенов — по цвету видно, что именно занимает окно модели.
+# Постоянная часть запроса на диаграмме: приглушённее памяти, чтобы был виден
+# именно её рост.
+FIXED_PART = "#2f4a86"
+
+PART_COLORS = {
+    "инструкция": "#7a5cff",
+    "память": ACCENT,
+    "вопрос": OK,
+    "схемы инструментов": WARN,
+}
 
 # Масштаб интерфейса: все размеры в QSS заданы в пикселях, поэтому Ctrl+колесо
 # просто пересобирает таблицу стилей, умножая числа перед «px». Отдельной копии
@@ -426,9 +449,11 @@ class MemoryDialog(QDialog):
 
         p = agent.passport()
         history = agent.transcript()
+        weight = agent.tokens_state()
         head = QLabel(
-            f"{len(history)} сообщ. в истории · {p['memory_messages']} уйдёт в модель · "
-            f"{p['history_file'] or 'история не ведётся'}"
+            f"{len(history)} сообщ. ≈ {_num(weight['history_tokens'])} токенов в истории · "
+            f"{p['memory_messages']} сообщ. ≈ {_num(weight['breakdown']['memory'])} токенов уйдёт "
+            f"в модель · {p['history_file'] or 'история не ведётся'}"
             if history else "История пуста — агент ещё ничего не запомнил."
         )
         head.setObjectName("note")
@@ -440,7 +465,11 @@ class MemoryDialog(QDialog):
         edge = len(history) - p["memory_messages"]
         for number, m in enumerate(history):
             if number == edge and edge > 0:
-                chat.add_system(f"↓ последние {p['memory_messages']} сообщ. — это и есть контекст модели")
+                chat.add_system(
+                    f"↓ последние {p['memory_messages']} сообщ. ≈ "
+                    f"{_num(weight['breakdown']['memory'])} токенов — это и есть контекст модели, "
+                    f"всё что выше хранится, но денег больше не стоит"
+                )
             chat.add_bubble(m["content"], "user" if m["role"] == "user" else "agent")
         chat.to_top()
 
@@ -448,6 +477,283 @@ class MemoryDialog(QDialog):
         tabs.addTab(chat, "Диалог")
         tabs.addTab(_history_table(agent.id, history), "В базе")
         lay.addWidget(tabs)
+
+
+class ContextBar(QFrame):
+    """Во что обойдётся следующий запрос — видно ещё до того, как его отправили.
+
+    Верхняя полоса показывает состав запроса в долях: инструкция агента, память,
+    схемы инструментов. По ней сразу заметно то, что обычно упускают, — на коротком
+    диалоге дороже всего стоят не слова пользователя, а описания инструментов.
+    Нижняя дорожка — тот же запрос в масштабе окна модели.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setObjectName("contextCard")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 10, 12, 11)
+        lay.setSpacing(7)
+
+        self.total = QLabel()
+        self.total.setObjectName("tokenBig")
+        lay.addWidget(self.total)
+
+        self.stack = QWidget()
+        self.stack.setFixedHeight(10)
+        self.stack_lay = QHBoxLayout(self.stack)
+        self.stack_lay.setContentsMargins(0, 0, 0, 0)
+        self.stack_lay.setSpacing(2)
+        lay.addWidget(self.stack)
+
+        self.legend = QLabel()
+        self.legend.setObjectName("tokenLine")
+        self.legend.setWordWrap(True)
+        lay.addWidget(self.legend)
+
+        track = QFrame()
+        track.setObjectName("barTrack")
+        track.setFixedHeight(10)
+        track_lay = QHBoxLayout(track)
+        track_lay.setContentsMargins(2, 2, 2, 2)
+        track_lay.setSpacing(0)
+        self.filled = QFrame()
+        self.filled.setMinimumWidth(2)
+        self.filled.setStyleSheet(f"background: {ACCENT2}; border-radius: 2px;")
+        self.rest = QWidget()
+        track_lay.addWidget(self.filled)
+        track_lay.addWidget(self.rest)
+        self.track_lay = track_lay
+        lay.addWidget(track)
+
+        self.window_line = QLabel()
+        self.window_line.setObjectName("tokenLine")
+        self.window_line.setWordWrap(True)
+        lay.addWidget(self.window_line)
+
+        # Третье число — вся переписка на диске. Она обычно тяжелее контекста, и
+        # разница между «хранится» и «уходит в модель» — это и есть цена памяти.
+        self.history_line = QLabel()
+        self.history_line.setObjectName("tokenLine")
+        self.history_line.setWordWrap(True)
+        lay.addWidget(self.history_line)
+
+    def show_state(self, state: dict) -> None:
+        """Перерисовать полосу по состоянию агента (`Agent.tokens_state`)."""
+        total = max(1, state["context_tokens"])
+        parts = [(name, value) for name, value in state["parts"] if value > 0]
+
+        while self.stack_lay.count():
+            widget = self.stack_lay.takeAt(0).widget()
+            if widget is not None:
+                widget.setParent(None)      # иначе старые сегменты живут до следующего цикла
+                widget.deleteLater()
+        for name, value in parts:
+            segment = QFrame()
+            segment.setMinimumWidth(3)
+            segment.setStyleSheet(f"background: {PART_COLORS.get(name, ACCENT)}; border-radius: 4px;")
+            segment.setToolTip(f"{name}: {_num(value)} токенов")
+            self.stack_lay.addWidget(segment, max(1, round(value / total * 1000)))
+
+        self.total.setText(f"{_num(total)} токенов в следующем запросе")
+        self.legend.setText(" · ".join(
+            f'<span style="color: {PART_COLORS.get(name, ACCENT)}">■</span> {name} {_num(value)}'
+            for name, value in parts
+        ) or "пока пусто")
+
+        fill = state["fill"]
+        self.track_lay.setStretch(0, max(1, round(fill * 1000)))
+        self.track_lay.setStretch(1, max(1, 1000 - round(fill * 1000)))
+        self.window_line.setText(
+            f"окно модели {_num(state['limit'])} · занято {fill * 100:.2f}% · "
+            f"запас под ответ {_num(state['reserve'])}"
+        )
+        self.history_line.setText(
+            f"вся история: {state['history_messages']} сообщ. ≈ {_num(state['history_tokens'])} т. · "
+            f"в модель уходит {state['window_messages']} сообщ."
+        )
+        self.setToolTip(
+            "Считается до отправки: инструкция агента, окно памяти и схемы инструментов уже\n"
+            "известны, значит известен и вес следующего запроса. История хранится целиком,\n"
+            "но платим мы только за то, что попадает в окно контекста."
+        )
+
+
+class UsageChart(QFrame):
+    """Как растёт расход: столбик на обращение и линия накопленной стоимости.
+
+    Столбики — токены запроса и ответа, линия — сколько потрачено суммарно. Именно
+    здесь видно главное свойство диалога с памятью: ответы остаются примерно
+    одинаковыми, а запрос дорожает с каждым обменом, потому что тащит за собой всю
+    предыдущую переписку.
+    """
+
+    def __init__(self, rows: list[dict]) -> None:
+        super().__init__()
+        self.setObjectName("chart")
+        self.rows = rows
+        self.setMinimumHeight(240)
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setFont(QFont("Consolas", 7))
+
+        if not self.rows:
+            painter.setPen(QColor(MUTED))
+            painter.drawText(self.rect(), Qt.AlignCenter,
+                             "Расхода пока нет — задайте агенту вопрос.")
+            painter.end()
+            return
+
+        left, right, top, bottom = 62, 66, 16, 26
+        width = max(1, self.width() - left - right)
+        height = max(1, self.height() - top - bottom)
+        # Столбик — это контекст запроса плюс ответ. Контекст разделён надвое:
+        # постоянная часть (инструкция и схемы инструментов платятся в каждом
+        # обращении одинаково) и память диалога — та самая, что растёт.
+        peak = max(row["context_tokens"] + row["completion_tokens"] for row in self.rows) or 1
+        spent, running = [], 0.0
+        for row in self.rows:
+            running += row["cost_usd"] or 0.0
+            spent.append(running)
+        money_peak = spent[-1] or 1e-9
+
+        painter.setPen(QPen(QColor(LINE), 1))
+        painter.drawLine(left, top + height, left + width, top + height)
+
+        step = width / len(self.rows)
+        bar = max(3.0, min(26.0, step * 0.6))
+        for number, row in enumerate(self.rows):
+            centre = left + step * (number + 0.5)
+            memory = min(row["memory_tokens"], row["context_tokens"])
+            blocks = (
+                (row["context_tokens"] - memory, FIXED_PART),  # инструкция, схемы, вопрос
+                (memory, PART_COLORS["память"]),             # то, что растёт с диалогом
+                (row["completion_tokens"], OK),              # ответ модели
+            )
+            base = top + height
+            for value, color in blocks:
+                block = value / peak * height
+                painter.fillRect(
+                    int(centre - bar / 2), int(base - block), int(bar), int(block), QColor(color)
+                )
+                base -= block
+
+        painter.setPen(QPen(QColor(WARN), 2))
+        previous = None
+        for number, value in enumerate(spent):
+            point = (left + step * (number + 0.5), top + height - value / money_peak * height)
+            if previous is not None:
+                painter.drawLine(int(previous[0]), int(previous[1]), int(point[0]), int(point[1]))
+            previous = point
+
+        painter.setPen(QColor(MUTED))
+        painter.drawText(4, top + 8, f"{_num(peak)} т.")
+        painter.drawText(4, top + height, "0")
+        painter.drawText(self.width() - right + 6, top + 8, f"${money_peak:.4f}")
+        painter.drawText(left, self.height() - 8, "обращение 1")
+        painter.drawText(self.width() - right - 34, self.height() - 8, f"#{self.rows[-1]['turn']}")
+        painter.end()
+
+
+class TokensDialog(QDialog):
+    """Токены и стоимость: сколько уходит в модель, из чего это состоит и как растёт.
+
+    Первая вкладка отвечает на вопрос «как дорожает разговор» — диаграмма и та же
+    таблица числами, строка на обращение. Вторая показывает состав текущего
+    контекста, разницу между историей на диске и тем, что реально уходит в модель,
+    и прогноз: на сколько обменов хватит окна и во что они обойдутся.
+    """
+
+    def __init__(self, agent: Agent, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Токены и стоимость · агент «{agent.profile.name}»")
+        self.resize(760, 620)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setSpacing(10)
+
+        state = agent.tokens_state()
+        rows = agent.usage_log()
+        spent = state["spent"]
+        calibration = state["calibration"]
+
+        head = QLabel(
+            f"{config.model_label(state['model'])} · окно {_num(state['limit'])} токенов · "
+            f"потолок ответа {_num(state['max_output'])} · потрачено за всё время "
+            f"{_num(spent['total_tokens'])} токенов ({_money(spent['cost_usd'])}) "
+            f"за {spent['turns']} обращени(й)"
+        )
+        head.setObjectName("note")
+        head.setWordWrap(True)
+        lay.addWidget(head)
+
+        tabs = QTabWidget()
+        tabs.addTab(self._growth_tab(agent.id, rows), "Рост по обращениям")
+        tabs.addTab(self._context_tab(agent, state, rows, calibration), "Состав и прогноз")
+        lay.addWidget(tabs)
+
+    def _growth_tab(self, agent_id: str, rows: list[dict]) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 10, 0, 0)
+        lay.setSpacing(10)
+
+        lay.addWidget(UsageChart(rows))
+        legend = QLabel(
+            f'<span style="color: {FIXED_PART}">■</span> постоянная часть запроса '
+            f'(инструкция и схемы) · '
+            f'<span style="color: {PART_COLORS["память"]}">■</span> память диалога · '
+            f'<span style="color: {OK}">■</span> ответ модели · '
+            f'<span style="color: {WARN}">—</span> накопленная стоимость'
+        )
+        legend.setObjectName("tokenLine")
+        legend.setWordWrap(True)
+        lay.addWidget(legend)
+        lay.addWidget(_usage_table(agent_id, rows), 1)
+        return page
+
+    def _context_tab(self, agent: Agent, state: dict, rows: list[dict], calibration: dict) -> QWidget:
+        page = QScrollArea()
+        page.setWidgetResizable(True)
+        body = QWidget()
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(0, 10, 10, 0)
+        lay.setSpacing(12)
+
+        lay.addWidget(_section("ЧТО УЙДЁТ В МОДЕЛЬ СЛЕДУЮЩИМ ЗАПРОСОМ"))
+        bar = ContextBar()
+        bar.show_state(state)
+        lay.addWidget(bar)
+
+        lay.addWidget(_section("ИСТОРИЯ ЦЕЛИКОМ И ОКНО КОНТЕКСТА"))
+        history = QLabel(
+            f"В базе лежит {state['history_messages']} сообщ. — это ≈{_num(state['history_tokens'])} "
+            f"токенов. В модель уходит только окно памяти: {state['window_messages']} сообщ. "
+            f"(≈{_num(state['breakdown']['memory'])} токенов). Разница и есть смысл двухуровневой "
+            f"памяти: разговор хранится целиком, а платим мы только за хвост."
+        )
+        history.setObjectName("subtitle")
+        history.setWordWrap(True)
+        lay.addWidget(history)
+
+        lay.addWidget(_section("ТОЧНОСТЬ СЧЁТЧИКА"))
+        accuracy = QLabel(_accuracy_text(calibration))
+        accuracy.setObjectName("subtitle")
+        accuracy.setWordWrap(True)
+        lay.addWidget(accuracy)
+
+        lay.addWidget(_section("КОГДА УПРЁМСЯ В ЛИМИТ"))
+        forecast = QLabel(_forecast_text(state, rows))
+        forecast.setObjectName("subtitle")
+        forecast.setWordWrap(True)
+        lay.addWidget(forecast)
+
+        lay.addStretch(1)
+        page.setWidget(body)
+        return page
 
 
 class AgentItem(QFrame):
@@ -753,9 +1059,27 @@ class AgentWindow(QMainWindow):
 
         lay.addWidget(_section("ГЛУБИНА ПАМЯТИ, ПАР"))
         self.mem_box = QSpinBox()
-        self.mem_box.setRange(0, 50)
+        self.mem_box.setRange(0, MEMORY_TURNS_MAX)
         self.mem_box.editingFinished.connect(lambda: self._apply(memory_turns=self.mem_box.value()))
         lay.addWidget(self.mem_box)
+
+        # Лимит ответа — настоящий предел генерации у модели. Поставьте маленький
+        # и увидите, что бывает при нехватке токенов: ответ обрывается на полуслове.
+        # Поле НАРОЧНО пускает больше потолка модели: границу проверяет агент, и
+        # пусть он сам объяснит отказ — интерфейсу дублировать его правила незачем.
+        self.answer_caption = _section("ЛИМИТ ОТВЕТА, ТОКЕНОВ")
+        lay.addWidget(self.answer_caption)
+        self.answer_box = QSpinBox()
+        self.answer_box.setRange(0, 999_999)
+        self.answer_box.setSingleStep(64)
+        self.answer_box.setSpecialValueText("без ограничения")
+        self.answer_box.setToolTip(
+            "Сколько токенов модель может сгенерировать в ответ.\n"
+            "0 — не ограничивать. Маленькое значение обрывает ответ на полуслове,\n"
+            "значение выше потолка модели агент отклонит и скажет, почему."
+        )
+        self.answer_box.editingFinished.connect(lambda: self._apply(max_tokens=self.answer_box.value()))
+        lay.addWidget(self.answer_box)
 
         lay.addWidget(_section("КАК АГЕНТ РАБОТАЕТ"))
         self.tools_box = QCheckBox("Инструменты")
@@ -783,6 +1107,12 @@ class AgentWindow(QMainWindow):
 
         lay.addStretch(1)
 
+        # Контекст показываем ДО отправки: сколько токенов уйдёт следующим запросом
+        # и из чего они складываются. Обновляется после каждой правки настроек.
+        lay.addWidget(_section("КОНТЕКСТ СЛЕДУЮЩЕГО ЗАПРОСА"))
+        self.context_bar = ContextBar()
+        lay.addWidget(self.context_bar)
+
         stats = QHBoxLayout()
         stats.setSpacing(8)
         self.turns_stat, turns_card = _stat("обращений")
@@ -792,6 +1122,11 @@ class AgentWindow(QMainWindow):
         stats.addWidget(mem_card)
         stats.addWidget(hist_card)
         lay.addLayout(stats)
+
+        tokens_btn = _ghost("Токены и стоимость")
+        tokens_btn.setToolTip("Как растут токены и цена по мере диалога")
+        tokens_btn.clicked.connect(lambda: TokensDialog(self.agent, self).exec())
+        lay.addWidget(tokens_btn)
 
         memory_btn = _ghost("Память и история")
         memory_btn.clicked.connect(lambda: MemoryDialog(self.agent, self).exec())
@@ -946,6 +1281,9 @@ class AgentWindow(QMainWindow):
         )
         self.storage_note.setToolTip(history_file or "")
 
+        # Вес контекста считает агент — окно только рисует полосу.
+        self.context_bar.show_state(self.agent.tokens_state())
+
         self._loading = True
         self.model_box.setCurrentIndex(max(0, self.model_box.findData(p["model"])))
         self.temp.setValue(round(p["temperature"] * 100))
@@ -954,32 +1292,73 @@ class AgentWindow(QMainWindow):
         self.tools_box.setChecked(p["tools_enabled"])
         self.plan_box.setChecked(p["planning"])
         self.steps_box.setValue(p["max_steps"])
+        # Потолок генерации у каждой модели свой: показываем его в подписи, но ввод
+        # не ограничиваем — за границу отвечает агент (и объясняет отказ словами).
+        self.answer_caption.setText(
+            f"ЛИМИТ ОТВЕТА · ПОТОЛОК {_num(config.model_max_output(p['model']))}"
+        )
+        self.answer_box.setValue(p["max_tokens"] or 0)
         self._loading = False
 
     def _show_meta(self, reply: AgentReply) -> None:
-        """Строка под ответом: метрики и ссылка на сырой обмен."""
+        """Строки под ответом: метрики, счёт в токенах и ссылка на сырой обмен."""
         u = reply.usage or {}
         cost = f" · ${reply.cost_usd:.6f} (free-квота)" if reply.cost_usd is not None else ""
         row = QWidget()
-        row_lay = QHBoxLayout(row)
-        row_lay.setContentsMargins(6, 0, 0, 4)
-        row_lay.setSpacing(10)
+        outer = QVBoxLayout(row)
+        outer.setContentsMargins(6, 0, 0, 4)
+        outer.setSpacing(2)
+
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(10)
         name = config.model_label(reply.model).split(" · ")[0]
-        meta = QLabel(
-            f"{name} · {reply.elapsed_s} c · "
-            f"{u.get('prompt_tokens', '?')}→{u.get('completion_tokens', '?')} токенов{cost} · "
+        meta = _wrapped(
+            f"{name} · {reply.elapsed_s} c · итого за обращение "
+            f"{_num(u.get('prompt_tokens', 0))}→{_num(u.get('completion_tokens', 0))} токенов{cost} · "
             f"обращение #{reply.turn} · "
             f"{f'{len(reply.steps)} шаг(ов) инструментами' if reply.steps else 'без инструментов'} · "
-            f"{reply.llm_calls} вызов(ов) модели"
+            f"{reply.llm_calls} вызов(ов) модели",
+            "meta",
         )
-        meta.setObjectName("meta")
-        meta.setWordWrap(True)
         link = QPushButton("сырой обмен →")
         link.setObjectName("link")
         link.setCursor(Qt.PointingHandCursor)
         link.clicked.connect(lambda: RawDialog(reply, self).exec())
-        row_lay.addWidget(meta, 1)      # метрики занимают всю строку,
-        row_lay.addWidget(link, 0)      # ссылка прижата к правому краю
+        top.addWidget(meta, 1)      # метрики занимают всю строку,
+        top.addWidget(link, 0)      # ссылка прижата к правому краю
+        outer.addLayout(top)
+
+        # Вторая строка — счёт за обращение: из чего сложился запрос, сколько занял
+        # ответ и насколько собственная оценка агента разошлась с фактом.
+        t = reply.tokens
+        if t:
+            b = t.breakdown
+            error = f"{t.error_pct:+.1f}%" if t.error_pct is not None else "—"
+            outer.addWidget(_wrapped(
+                f"запрос {_num(t.prompt_tokens)} т. = инструкция {_num(b.system)} + память "
+                f"{_num(b.memory)} + вопрос {_num(b.question)} + схемы {_num(b.tools)} · "
+                f"ответ {_num(t.completion_tokens)} т. · оценка до отправки {_num(t.estimated)} "
+                f"({error}) · контекст занят на {t.fill * 100:.2f}% от {_num(t.limit)}",
+                "meta",
+            ))
+
+            trouble = []
+            if t.trimmed_pairs:
+                trouble.append(
+                    f"контекст переполнен: из окна памяти выброшено {t.trimmed_pairs} пар(ы) — "
+                    "начало разговора в модель уже не ушло (в истории оно осталось)"
+                )
+            if t.truncated:
+                trouble.append(
+                    f"ответ оборван по лимиту генерации ({_num(t.reserve)} токенов): "
+                    "модели не хватило места договорить"
+                )
+            if trouble:
+                warning = _wrapped("⚠ " + " · ".join(trouble), "meta")
+                warning.setStyleSheet(f"color: {WARN}; font-size: 11px; background: transparent;")
+                outer.addWidget(warning)
+
         self.chat.add_row(row)
 
     def _show_trace(self, reply: AgentReply) -> None:
@@ -1114,11 +1493,13 @@ class AgentWindow(QMainWindow):
 
         when = _when(p["last_seen_at"])
         if p["restored"]:
+            weight = self.agent.tokens_state()
             self.chat.add_system(
-                f"Разговор восстановлен из истории: {len(messages)} сообщ., "
-                f"последний раз говорили {when}. Агент продолжает с того же места — "
-                f"в модель уйдут последние {p['memory_messages']} сообщ. (глубина памяти "
-                f"{_plural(p['memory_turns'], 'пара', 'пары', 'пар')})."
+                f"Разговор восстановлен из истории: {len(messages)} сообщ. ≈ "
+                f"{_num(weight['history_tokens'])} токенов, последний раз говорили {when}. "
+                f"Агент продолжает с того же места — в модель уйдут последние "
+                f"{p['memory_messages']} сообщ. ≈ {_num(weight['breakdown']['memory'])} токенов "
+                f"(глубина памяти {_plural(p['memory_turns'], 'пара', 'пары', 'пар')})."
             )
         else:
             self.chat.add_system(
@@ -1245,6 +1626,23 @@ def _trace_label(text: str) -> QLabel:
     return label
 
 
+def _wrapped(text: str, name: str) -> QLabel:
+    """Метка с переносом, которая честно сообщает layout свою высоту.
+
+    QLabel с `setWordWrap` считает высоту по своему sizeHint и, если строка
+    занимает больше строк, чем он ожидал, накладывается на соседей. Лечится это
+    политикой размера с heightForWidth: тогда layout спрашивает высоту под ту
+    ширину, которая досталась метке на самом деле.
+    """
+    label = QLabel(text)
+    label.setObjectName(name)
+    label.setWordWrap(True)
+    policy = QSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+    policy.setHeightForWidth(True)
+    label.setSizePolicy(policy)
+    return label
+
+
 def _history_table(agent_id: str, history: list[dict]) -> QPlainTextEdit:
     """Сообщения так, как они лежат в базе: строка таблицы — строка текста.
 
@@ -1272,6 +1670,100 @@ def _history_table(agent_id: str, history: list[dict]) -> QPlainTextEdit:
     view.setReadOnly(True)
     view.setLineWrapMode(QPlainTextEdit.NoWrap)
     return view
+
+
+def _usage_table(agent_id: str, rows: list[dict]) -> QPlainTextEdit:
+    """Расход так, как он лежит в базе: строка таблицы `usage` — строка текста."""
+    lines = [
+        "sqlite> SELECT turn, llm_calls, prompt_tokens, completion_tokens, cost_usd,",
+        "               context_tokens, estimated FROM usage",
+        f"        WHERE agent_id = '{agent_id}' ORDER BY id;",
+        "",
+        f"{'обр.':>5} {'выз.':>5} {'запрос':>8} {'ответ':>7} {'стоимость':>10} "
+        f"{'накоплено':>10} {'контекст':>9} {'оценка':>8} {'расх.':>7}",
+        f"{'-' * 5} {'-' * 5} {'-' * 8} {'-' * 7} {'-' * 10} {'-' * 10} {'-' * 9} {'-' * 8} {'-' * 7}",
+    ]
+    running = 0.0
+    for row in rows:
+        running += row["cost_usd"] or 0.0
+        estimated, actual = row["estimated"], row["context_tokens"]
+        error = f"{(estimated - actual) / actual * 100:+.1f}%" if estimated and actual else "—"
+        lines.append(
+            f"{row['turn']:>5} {row['llm_calls']:>5} {row['prompt_tokens']:>8} "
+            f"{row['completion_tokens']:>7} {_money(row['cost_usd']):>10} {_money(running):>10} "
+            f"{actual:>9} {estimated:>8} {error:>7}"
+        )
+    if not rows:
+        lines.append("-- строк нет: агент ещё не потратил ни одного токена")
+    else:
+        lines += [
+            "",
+            "-- «запрос» и «ответ» — факт по всем вызовам обращения (план, шаги, итог),",
+            "-- «контекст» — вес первого запроса, «оценка» — что счётчик обещал до отправки.",
+        ]
+
+    view = QPlainTextEdit("\n".join(lines))
+    view.setObjectName("raw")
+    view.setReadOnly(True)
+    view.setLineWrapMode(QPlainTextEdit.NoWrap)
+    return view
+
+
+def _accuracy_text(calibration: dict) -> str:
+    """Насколько счётчику можно верить — словами."""
+    if not calibration["samples"]:
+        return ("Сверять пока не с чем: оценка считается по символам до отправки, а точное "
+                "число приходит в `usage` вместе с ответом. Задайте агенту вопрос — и здесь "
+                "появится расхождение.")
+    return (
+        f"Замеров: {calibration['samples']}, среднее расхождение оценки с фактом — "
+        f"{calibration['error_pct']}%, накопленная поправка ×{calibration['factor']}. "
+        f"Последняя сверка: счётчик обещал {_num(calibration['last_estimated'])} токенов, "
+        f"модель насчитала {_num(calibration['last_actual'])}. Поправка живёт на каждую модель "
+        f"отдельно: у них разные токенайзеры."
+    )
+
+
+def _forecast_text(state: dict, rows: list[dict]) -> str:
+    """Прогноз: на сколько обменов хватит окна и что случится, когда оно кончится."""
+    room = state["limit"] - state["reserve"] - state["context_tokens"]
+    tail = "Когда места не останется, агент начнёт выбрасывать из окна самые старые пары " \
+           "«вопрос-ответ»: в базе они сохранятся, но в модель уже не уйдут — начало разговора " \
+           "агент забудет. Запрос, который не помещается даже без памяти, он отклонит сам, " \
+           "не тратя вызов."
+    dropped = sum(row["trimmed_pairs"] for row in rows)
+    if dropped:
+        tail += f" Пар, уже выброшенных из окна за всё время: {dropped}."
+
+    growth = 0.0
+    if len(rows) >= 2:
+        growth = (rows[-1]["context_tokens"] - rows[0]["context_tokens"]) / (len(rows) - 1)
+    if growth <= 0:
+        return (f"Свободно ещё {_num(max(0, room))} токенов окна. Роста пока не видно — "
+                f"нужно хотя бы пара обращений подряд, чтобы его измерить. " + tail)
+
+    turns_left = int(room / growth)
+    cost = [row["cost_usd"] or 0.0 for row in rows]
+    average = sum(cost) / len(cost) if cost else 0.0
+    return (
+        f"Каждое обращение прибавляет к контексту в среднем {_num(round(growth))} токенов. "
+        f"Свободно {_num(max(0, room))} — значит, окна хватит примерно на {_num(turns_left)} "
+        f"обменов при нынешней длине реплик. Средняя цена обращения сейчас {_money(average)}, "
+        f"то есть десяток следующих обменов обойдётся около {_money(average * 10)} "
+        f"(теоретически: пока жива бесплатная квота, деньги не списываются). " + tail
+    )
+
+
+def _num(value: float | int) -> str:
+    """Число с пробелами по тысячам: 1 000 000 читается, 1000000 — нет."""
+    return f"{int(value):,}".replace(",", " ")
+
+
+def _money(value: float | None) -> str:
+    """Стоимость в долларах; None — цены у модели нет."""
+    if value is None:
+        return "—"
+    return f"${value:.2f}" if value >= 1 else f"${value:.6f}"
 
 
 def _plural(count: int, one: str, few: str, many: str) -> str:

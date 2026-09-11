@@ -9,15 +9,22 @@
 
     1. проверка и нормализация входа
     2. план: агент отдельным вызовом решает, нужен ли план, и пишет шаги
-    3. цикл работы: модель либо просит вызвать инструмент, либо даёт ответ.
+    3. бюджет контекста: агент считает вес будущего запроса в токенах и, если тот
+       не помещается в окно модели, подрезает память — до вызова, а не после
+    4. цикл работы: модель либо просит вызвать инструмент, либо даёт ответ.
        Инструмент исполняет агент, результат возвращается в диалог, цикл идёт
        дальше — до финального ответа или до потолка шагов
-    4. разбор ответа
-    5. запись в память и в историю на диске (только вопрос и итоговый ответ,
-       без служебной переписки с инструментами)
+    5. разбор ответа и сверка оценки токенов с фактическим `usage`
+    6. запись в память, в историю на диске и в расход токенов (в памяти только
+       вопрос и итоговый ответ, без служебной переписки с инструментами)
 
-Именно шаг 3 отличает агента от чата: одна фраза пользователя разворачивается в
+Именно шаг 4 отличает агента от чата: одна фраза пользователя разворачивается в
 последовательность действий, которые агент выбирает и выполняет сам.
+
+Токены агент считает сам и до отправки (`app/tokens.py`): контекст — ресурс с
+жёстким потолком, и знать его цену постфактум поздно. Оценка сверяется с
+фактическим `usage` из ответа, расхождение уходит в калибровку, а расход каждого
+обращения ложится в хранилище — по нему видно, как дорожает разговор.
 
 Память двухуровневая. В `_memory` живёт окно контекста — последние `memory_turns`
 пар «вопрос-ответ», ровно то, что уходит в модель. Полная переписка вместе с
@@ -37,7 +44,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
-from . import config, llm, tools
+from . import config, llm, tokens, tools
 from .store import Store
 
 logger = logging.getLogger("app.agent")
@@ -122,6 +129,19 @@ FINISH_NUDGE = (
     "тому, что уже сделано, и честно скажи, если что-то осталось невыполненным."
 )
 
+# Потолок глубины памяти. Ограничение не техническое, а денежное: окно контекста у
+# моделей огромное, но каждая пара из памяти уезжает в модель заново при каждом
+# обращении — сто пар в памяти означают сто пар в каждом счёте.
+MEMORY_TURNS_MAX = 200
+
+# По этим словам в ответе провайдера видно, что запрос отклонён именно по длине.
+# Такую ошибку агент переводит на человеческий язык: «Модель не ответила: 400 …»
+# ничего не объясняет, а «в запрос ушло 1.2M токенов при окне 1M» — объясняет.
+LENGTH_ERROR_MARKERS = (
+    "input length", "range of input", "context length", "maximum context",
+    "too long", "exceeds", "token limit",
+)
+
 
 @dataclass
 class AgentStep:
@@ -179,6 +199,63 @@ class _Totals:
 
 
 @dataclass
+class TokenReport:
+    """Счёт за обращение в токенах: оценка до вызова и факт после.
+
+    Оценку агент считает сам (`app/tokens.py`) ещё до того, как запрос ушёл в
+    сеть, — иначе о цене и о переполнении контекста узнаёшь только по факту, то
+    есть когда платить уже поздно. Факт приходит в `usage`, и разница между
+    оценкой и фактом здесь же: по ней видно, можно ли счётчику верить.
+    """
+    breakdown: tokens.Breakdown = field(default_factory=tokens.Breakdown)
+    estimated: int = 0            # оценка запроса до отправки
+    prompt_tokens: int = 0        # факт по тому же запросу
+    completion_tokens: int = 0    # факт по итоговому ответу
+    total_prompt: int = 0         # факт по всем вызовам обращения (план, шаги, итог)
+    total_completion: int = 0
+    limit: int = 0                # окно контекста модели
+    reserve: int = 0              # запас, оставленный под ответ
+    max_output: int = 0           # потолок генерации у модели
+    trimmed_pairs: int = 0        # сколько пар памяти выкинуто, чтобы влезть в окно
+    truncated: bool = False       # ответ упёрся в лимит генерации и оборван
+
+    @property
+    def context_used(self) -> int:
+        """Сколько токенов реально заняло окно контекста (факт, пока его нет — оценка)."""
+        return self.prompt_tokens or self.estimated
+
+    @property
+    def fill(self) -> float:
+        """Доля окна контекста, занятая запросом."""
+        return self.context_used / self.limit if self.limit else 0.0
+
+    @property
+    def error_pct(self) -> float | None:
+        """На сколько процентов оценка разошлась с фактом (со знаком)."""
+        if not self.prompt_tokens or not self.estimated:
+            return None
+        return round((self.estimated - self.prompt_tokens) / self.prompt_tokens * 100, 1)
+
+    def to_dict(self) -> dict:
+        return {
+            "breakdown": self.breakdown.to_dict(),
+            "estimated": self.estimated,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_prompt": self.total_prompt,
+            "total_completion": self.total_completion,
+            "limit": self.limit,
+            "reserve": self.reserve,
+            "max_output": self.max_output,
+            "trimmed_pairs": self.trimmed_pairs,
+            "truncated": self.truncated,
+            "context_used": self.context_used,
+            "fill": self.fill,
+            "error_pct": self.error_pct,
+        }
+
+
+@dataclass
 class AgentReply:
     """Ответ агента: текст, трасса выполненных шагов и метрики всего обращения."""
     text: str
@@ -194,6 +271,7 @@ class AgentReply:
     temperature: float | None = None
     tier: str | None = None
     sent_messages: int = 0          # сколько сообщений ушло в модель в последнем вызове
+    tokens: TokenReport | None = None   # счёт за обращение: оценка, факт и лимиты
     request: dict | None = None     # «сырой обмен»: тело последнего запроса
     response: dict | None = None    # «сырой обмен»: ответ модели как есть
 
@@ -213,6 +291,7 @@ class AgentReply:
             "temperature": self.temperature,
             "tier": self.tier,
             "sent_messages": self.sent_messages,
+            "tokens": self.tokens.to_dict() if self.tokens else None,
             "request": self.request,
             "response": self.response,
         }
@@ -261,12 +340,29 @@ class Agent:
         )
 
         plan = self._make_plan(text, totals)                # 2. план действий
-        messages = self._build_messages(text, plan)         #    сборка запроса
         specs = tools.specs() if self.tools_enabled else None
+        prompt = self._system_prompt(plan)
+        window, dropped = self._fit_context(prompt, text, specs)   # 3. бюджет контекста
+        report = TokenReport(
+            breakdown=tokens.measure(prompt, window, text, specs, self.model),
+            limit=self._context_limit(),
+            reserve=self._answer_reserve(),
+            max_output=config.model_max_output(self.model),
+            trimmed_pairs=dropped,
+        )
+        report.estimated = report.breakdown.total
+        messages = self._build_messages(prompt, window, text)      #    сборка запроса
+        logger.info(
+            "Агент «%s» [%s]: в запрос уйдёт ≈%d токенов (инструкция %d + память %d + вопрос %d "
+            "+ схемы %d) из окна %d",
+            self.profile.name, self.id, report.estimated, report.breakdown.system,
+            report.breakdown.memory, report.breakdown.question, report.breakdown.tools, report.limit,
+        )
 
-        raw = None
-        for _ in range(max(1, self.max_steps)):             # 3. цикл работы
+        raw, first_usage = None, None
+        for _ in range(max(1, self.max_steps)):             # 4. цикл работы
             raw = totals.add(self._call(messages, specs))
+            first_usage = first_usage or raw.get("usage")   #    факт по первому запросу
             if not raw["tool_calls"]:
                 break                                       #    модель дала ответ
             messages.append(raw["message"])                 #    протокол требует вернуть
@@ -280,14 +376,18 @@ class Agent:
             messages.append({"role": "system", "content": FINISH_NUDGE})
             raw = totals.add(self._call(messages, None))
 
-        answer = self._postprocess(raw["content"], steps)   # 4. разбор ответа
+        answer = self._postprocess(raw["content"], steps)   # 5. разбор ответа
+        self._close_report(report, totals, raw, first_usage)
         self.turns += 1
-        self._remember(text, answer)                        # 5. память и история
+        self._remember(text, answer, report, totals)        # 6. память, история, расход
 
         elapsed = time.perf_counter() - started
         logger.info(
-            "Агент «%s» [%s] → ответ #%d за %.2f c · шагов=%d · вызовов модели=%d · в памяти %d сообщ.",
-            self.profile.name, self.id, self.turns, elapsed, len(steps), totals.llm_calls, len(self._memory),
+            "Агент «%s» [%s] → ответ #%d за %.2f c · шагов=%d · вызовов модели=%d · в памяти %d сообщ. · "
+            "токены: оценка %d → факт %d (%s%%), ответ %d, всего за обращение %d",
+            self.profile.name, self.id, self.turns, elapsed, len(steps), totals.llm_calls,
+            len(self._memory), report.estimated, report.prompt_tokens, report.error_pct,
+            report.completion_tokens, report.total_prompt + report.total_completion,
         )
 
         return AgentReply(
@@ -304,6 +404,7 @@ class Agent:
             temperature=raw["temperature"],
             tier=raw["tier"],
             sent_messages=len(messages),
+            tokens=report,
             request=raw["request"],
             response=raw["response"],
         )
@@ -358,17 +459,99 @@ class Agent:
         logger.info("Агент «%s» [%s]: план из %d шагов", self.profile.name, self.id, len(plan))
         return plan
 
-    def _build_messages(self, text: str, plan: list[str]) -> list[dict]:
+    def _build_messages(self, prompt: str, window: list[dict], text: str) -> list[dict]:
         """Собрать сообщения для модели: роль агента + план + память + новый вход.
 
         Здесь и видно отличие агента от голого вызова API: интерфейс прислал одну
-        строку, а в модель уходит контекст, который агент собрал сам.
+        строку, а в модель уходит контекст, который агент собрал сам. `window` —
+        это память, уже подрезанная под окно контекста (см. `_fit_context`).
         """
         return (
-            [{"role": "system", "content": self._system_prompt(plan)}]
-            + list(self._memory)
+            [{"role": "system", "content": prompt}]
+            + list(window)
             + [{"role": "user", "content": text}]
         )
+
+    def _context_limit(self) -> int:
+        """Окно контекста выбранной модели, токенов."""
+        return config.model_context(self.model)
+
+    def _answer_reserve(self) -> int:
+        """Сколько токенов окна держим под ответ: контекст общий на запрос и ответ.
+
+        Если лимит ответа задан явно — резервируем ровно его, иначе берём запас по
+        умолчанию, но не больше того, что модель вообще способна сгенерировать. И
+        в любом случае не больше половины окна: у модели с тесным контекстом запас
+        под ответ иначе съел бы место под сам запрос.
+        """
+        wanted = int(self.max_tokens) if self.max_tokens else min(
+            config.ANSWER_RESERVE, config.model_max_output(self.model)
+        )
+        return max(1, min(wanted, self._context_limit() // 2))
+
+    def _fit_context(self, prompt: str, question: str, specs: list[dict] | None) -> tuple[list[dict], int]:
+        """Уложить запрос в окно контекста, при нехватке — забыв самое старое.
+
+        Это и есть поведение агента при переполнении. Ждать ошибки от API нельзя:
+        она приходит после того, как запрос уже ушёл, и ничего не объясняет. Агент
+        считает вес запроса сам и выкидывает из окна самые старые пары «вопрос-
+        ответ», пока запрос не поместится, — ценой того, что начало разговора он
+        забывает. История на диске при этом цела: подрезается только контекст.
+
+        Если не помещается даже запрос без памяти (огромный вопрос, раздутая
+        инструкция), честнее отказаться до вызова: платить за заведомо отклонённый
+        запрос незачем.
+        """
+        room = self._context_limit() - self._answer_reserve()
+        fixed = tokens.measure(prompt, [], question, specs, self.model).total
+        if fixed > room:
+            raise AgentError(
+                f"Запрос не помещается в контекст модели: без памяти это уже ≈{fixed} токенов "
+                f"при доступных {room} (окно {self._context_limit()} минус запас под ответ "
+                f"{self._answer_reserve()}). Сократите вопрос, выключите инструменты или "
+                f"возьмите модель с большим окном."
+            )
+        window = list(self._memory)
+        dropped = 0
+        while window and fixed + tokens.measure_messages(window, self.model) > room:
+            del window[:2]      # самая старая пара «вопрос-ответ» уходит первой
+            dropped += 1
+        if dropped:
+            logger.warning(
+                "Агент «%s» [%s]: контекст переполнен — из памяти выброшено %d пар(ы), "
+                "в запрос уйдут только последние %d сообщ.",
+                self.profile.name, self.id, dropped, len(window),
+            )
+        return window, dropped
+
+    def _close_report(
+        self,
+        report: TokenReport,
+        totals: _Totals,
+        raw: dict,
+        first_usage: dict | None,
+    ) -> None:
+        """Дописать в счёт фактические токены и сверить с ними собственную оценку.
+
+        Сверка нужна не для красоты: счётчик оценивает текст по символам, и без
+        сравнения с `usage` невозможно понять, можно ли доверять его прогнозу и
+        проверке на переполнение. Расхождение запоминается в калибровке модели —
+        следующая оценка будет точнее.
+        """
+        if first_usage:
+            report.prompt_tokens = first_usage["prompt_tokens"]
+            tokens.observe(self.model, report.estimated, report.prompt_tokens)
+        last_usage = raw.get("usage") or {}
+        report.completion_tokens = last_usage.get("completion_tokens", 0)
+        totals_usage = totals.usage() or {}
+        report.total_prompt = totals_usage.get("prompt_tokens", 0)
+        report.total_completion = totals_usage.get("completion_tokens", 0)
+        report.truncated = raw.get("finish_reason") == "length"
+        if report.truncated:
+            logger.warning(
+                "Агент «%s» [%s]: ответ оборван по лимиту генерации (%d токенов)",
+                self.profile.name, self.id, report.completion_tokens,
+            )
 
     def _system_prompt(self, plan: list[str]) -> str:
         """Роль агента, дополненная правилами про инструменты, память и план.
@@ -404,6 +587,18 @@ class Agent:
             )
         except Exception as e:  # 401/403/429, сеть и прочее
             logger.warning("Агент «%s» [%s]: вызов модели не удался: %s", self.profile.name, self.id, e)
+            text = str(e)
+            if any(marker in text.lower() for marker in LENGTH_ERROR_MARKERS):
+                # Переполнение, которое проскочило собственную проверку: оценка по
+                # символам не токенайзер и может ошибиться. Показываем не «400», а
+                # то, из-за чего запрос отклонён.
+                weight = tokens.measure_request(messages, specs, self.model)
+                raise AgentError(
+                    f"Модель отклонила запрос по длине: в него ушло ≈{weight} токенов при окне "
+                    f"{self._context_limit()} и лимите ответа {self._answer_reserve()}. "
+                    f"Уменьшите глубину памяти, сократите вопрос или начните разговор заново.\n"
+                    f"Ответ провайдера: {text}"
+                ) from e
             raise AgentError(f"Модель не ответила: {e}") from e
 
     def _run_tool(self, number: int, call: dict) -> AgentStep:
@@ -460,15 +655,23 @@ class Agent:
             "Модель вернула пустой ответ — возможно, генерация упёрлась в ограничение длины."
         )
 
-    def _remember(self, question: str, answer: str) -> None:
-        """Шаг 5. Запомнить обмен: в окно контекста и в историю на диске.
+    def _remember(
+        self,
+        question: str,
+        answer: str,
+        report: TokenReport | None = None,
+        totals: _Totals | None = None,
+    ) -> None:
+        """Шаг 6. Запомнить обмен: в окно контекста, в историю и в расход токенов.
 
         В памяти держим только вопрос и итоговый ответ: служебная переписка с
         инструментами нужна внутри одного обращения, а в долгой памяти она бы
         быстро съела контекст и деньги.
 
-        В хранилище уходит та же пара плюс обновлённое состояние агента — одной
-        записью, чтобы история и счётчик обращений не разъезжались.
+        В хранилище уходит та же пара, обновлённое состояние агента и строка
+        расхода — одной записью, чтобы история, счётчик обращений и токены не
+        разъезжались. Строка расхода и превращает «сколько стоило» в наблюдаемую
+        величину: по ней видно, как цена растёт от обращения к обращению.
         """
         pair = [
             {"role": "user", "content": question},
@@ -477,7 +680,26 @@ class Agent:
         self._memory.extend(pair)
         self._trim_memory()
         if self.store is not None:
-            self.store.save_turn(self.state(), pair)
+            self.store.save_turn(self.state(), pair, self._usage_row(report, totals))
+
+    def _usage_row(self, report: TokenReport | None, totals: _Totals | None) -> dict | None:
+        """Расход обращения одной строкой — то, из чего потом рисуется рост цены."""
+        if report is None or totals is None:
+            return None
+        return {
+            "turn": self.turns,
+            "model": self.model,
+            "prompt_tokens": report.total_prompt,
+            "completion_tokens": report.total_completion,
+            "total_tokens": report.total_prompt + report.total_completion,
+            "cost_usd": totals.cost_usd if totals.has_cost else None,
+            "llm_calls": totals.llm_calls,
+            "estimated": report.estimated,
+            "context_tokens": report.context_used,
+            "memory_tokens": report.breakdown.memory,
+            "context_limit": report.limit,
+            "trimmed_pairs": report.trimmed_pairs,
+        }
 
     def _trim_memory(self) -> None:
         """Оставить в памяти только последние `memory_turns` пар «вопрос-ответ»."""
@@ -512,6 +734,7 @@ class Agent:
         tools_enabled: bool | None = None,
         planning: bool | None = None,
         max_steps: int | None = None,
+        max_tokens: int | None = None,
     ) -> None:
         """Изменить настройки агента.
 
@@ -524,13 +747,21 @@ class Agent:
                 # config.MODELS только модели со Stop-on-Exhaust.
                 raise AgentError(f"Модель «{model}» не в безопасном списке. Выберите модель из списка.")
             self.model = model
+            ceiling = config.model_max_output(model)
+            if self.max_tokens and self.max_tokens > ceiling:
+                # У новой модели потолок генерации может быть ниже — иначе первый же
+                # вызов вернул бы «Range of max_tokens should be [1, N]».
+                logger.info("Лимит ответа %d выше потолка модели — уменьшен до %d", self.max_tokens, ceiling)
+                self.max_tokens = ceiling
         if temperature is not None:
             if not 0 <= temperature < 2:
                 raise AgentError("Температура должна быть в диапазоне [0, 2).")
             self.temperature = float(temperature)
         if memory_turns is not None:
-            if not 0 <= memory_turns <= 50:
-                raise AgentError("Глубина памяти должна быть от 0 до 50 пар сообщений.")
+            if not 0 <= memory_turns <= MEMORY_TURNS_MAX:
+                raise AgentError(
+                    f"Глубина памяти должна быть от 0 до {MEMORY_TURNS_MAX} пар сообщений."
+                )
             self.memory_turns = int(memory_turns)
             self._load_memory()  # глубину увеличили — доберём забытое из истории
         if tools_enabled is not None:
@@ -541,10 +772,19 @@ class Agent:
             if not 1 <= max_steps <= 12:
                 raise AgentError("Потолок шагов должен быть от 1 до 12.")
             self.max_steps = int(max_steps)
+        if max_tokens is not None:
+            ceiling = config.model_max_output(self.model)
+            if max_tokens and not 1 <= max_tokens <= ceiling:
+                raise AgentError(
+                    f"Лимит ответа должен быть от 1 до {ceiling} токенов: столько модель "
+                    f"«{config.model_label(self.model)}» способна сгенерировать за раз."
+                )
+            self.max_tokens = int(max_tokens) or None   # ноль означает «без ограничения»
         logger.info(
-            "Агент «%s» [%s]: настройки — модель=%s, t°=%s, память=%d пар, инструменты=%s, план=%s, шагов=%d",
+            "Агент «%s» [%s]: настройки — модель=%s, t°=%s, память=%d пар, инструменты=%s, "
+            "план=%s, шагов=%d, лимит ответа=%s",
             self.profile.name, self.id, self.model, self.temperature, self.memory_turns,
-            self.tools_enabled, self.planning, self.max_steps,
+            self.tools_enabled, self.planning, self.max_steps, self.max_tokens or "без ограничения",
         )
         self.persist()  # настройки тоже переживают перезапуск
 
@@ -687,6 +927,54 @@ class Agent:
         if self.store is not None:
             return self.store.messages(self.id)
         return self.memory
+
+    def tokens_state(self) -> dict:
+        """Во что обойдётся следующий запрос и сколько уже потрачено за всё время.
+
+        Считается до всякого вызова: инструкция, окно памяти и схемы инструментов
+        уже известны, а значит известен и вес контекста. Интерфейс показывает это
+        полосой — видно, как разговор занимает окно модели и из чего он состоит.
+        Отдельно считается ВСЯ переписка на диске: обычно она заметно больше
+        контекста, и разница между «сохранено» и «уходит в модель» — это и есть
+        цена памяти.
+        """
+        specs = tools.specs() if self.tools_enabled else None
+        breakdown = tokens.measure(self._system_prompt([]), self._memory, "", specs, self.model)
+        limit = self._context_limit()
+        history = self.transcript()
+        fix = tokens.calibration(self.model)
+        return {
+            "model": self.model,
+            "breakdown": breakdown.to_dict(),
+            "parts": breakdown.parts(),
+            "context_tokens": breakdown.total,
+            "limit": limit,
+            "reserve": self._answer_reserve(),
+            "max_output": config.model_max_output(self.model),
+            "fill": breakdown.total / limit if limit else 0.0,
+            "window_messages": len(self._memory),
+            "history_messages": len(history),
+            "history_tokens": tokens.measure_history(history, self.model),
+            "calibration": {
+                "factor": round(fix.factor, 3),
+                "samples": fix.samples,
+                "error_pct": fix.error_pct,
+                "last_estimated": fix.last_estimated,
+                "last_actual": fix.last_actual,
+            },
+            "spent": self.spent(),
+        }
+
+    def spent(self) -> dict:
+        """Итог по расходу токенов за всё время жизни агента (из хранилища)."""
+        if self.store is None:
+            return {"turns": 0, "prompt_tokens": 0, "completion_tokens": 0,
+                    "total_tokens": 0, "cost_usd": 0.0, "llm_calls": 0}
+        return self.store.usage_totals(self.id)
+
+    def usage_log(self) -> list[dict]:
+        """Расход по обращениям, по строке на обращение: из этого растёт диаграмма."""
+        return self.store.usage(self.id) if self.store is not None else []
 
     def passport(self) -> dict:
         """Всё состояние агента одним словарём — то, что рисует интерфейс."""

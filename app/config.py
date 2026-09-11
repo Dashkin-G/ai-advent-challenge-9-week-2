@@ -34,14 +34,34 @@ DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "qwen3.8-max")
 # реально она не списывается. None в цене → стоимость не считаем.
 # ВНИМАНИЕ: цены Flash/27B — ОРИЕНТИРОВОЧНЫЕ, Max — из спеки (2/6). Сверять с
 # Model Studio Pricing своей консоли.
+#
+# `context` — окно контекста: сколько токенов модель принимает за один запрос
+# вместе с ответом. `max_output` — потолок генерации: он же предел параметра
+# max_tokens, и это проверено у самого API (запрос с заведомо большим значением
+# возвращает «Range of max_tokens should be [1, N]»). Контекст взят из описания
+# моделей — сверять с консолью, если модель обновят.
 MODELS = [
-    {"code": "qwen3.6-flash", "label": "Qwen 3.6 Flash · лёгкая",  "tier": "лёгкая",  "price_in": 0.05, "price_out": 0.40},
-    {"code": "qwen3.8-flash", "label": "Qwen 3.8 Flash · быстрая", "tier": "лёгкая",  "price_in": 0.15, "price_out": 0.60},
-    {"code": "qwen3.6-27b",   "label": "Qwen 3.6 27B · средняя",   "tier": "средняя", "price_in": 0.70, "price_out": 2.00},
-    {"code": "qwen3.8-max",   "label": "Qwen 3.8 Max · сильная",   "tier": "тяжёлая", "price_in": 2.00, "price_out": 6.00},
+    {"code": "qwen3.6-flash", "label": "Qwen 3.6 Flash · лёгкая",  "tier": "лёгкая",  "price_in": 0.05, "price_out": 0.40,
+     "context": 1_000_000, "max_output": 65_536},
+    {"code": "qwen3.8-flash", "label": "Qwen 3.8 Flash · быстрая", "tier": "лёгкая",  "price_in": 0.15, "price_out": 0.60,
+     "context": 1_000_000, "max_output": 131_072},
+    {"code": "qwen3.6-27b",   "label": "Qwen 3.6 27B · средняя",   "tier": "средняя", "price_in": 0.70, "price_out": 2.00,
+     "context": 262_144, "max_output": 65_536},
+    {"code": "qwen3.8-max",   "label": "Qwen 3.8 Max · сильная",   "tier": "тяжёлая", "price_in": 2.00, "price_out": 6.00,
+     "context": 1_000_000, "max_output": 131_072},
 ]
 
 MODEL_BY_CODE = {m["code"]: m for m in MODELS}
+
+# Для модели вне реестра лимиты неизвестны — берём заведомо скромные, чтобы
+# проверка бюджета скорее перестраховалась, чем пропустила переполнение.
+FALLBACK_CONTEXT = 32_768
+FALLBACK_MAX_OUTPUT = 4_096
+
+# Сколько токенов контекста агент держит про запас под ответ модели, когда лимит
+# ответа не задан явно. Контекст — общий на запрос и ответ: если занять его весь
+# запросом, генерации просто не останется места.
+ANSWER_RESERVE = int(os.getenv("ANSWER_RESERVE", "4096"))
 
 
 def is_allowed_model(code: str) -> bool:
@@ -59,6 +79,18 @@ def model_tier(code: str) -> str | None:
     """Ресурсоёмкость модели для меты (лёгкая/средняя/тяжёлая); None — вне реестра."""
     m = MODEL_BY_CODE.get(code)
     return m["tier"] if m else None
+
+
+def model_context(code: str) -> int:
+    """Окно контекста модели в токенах: сколько влезает в один запрос с ответом."""
+    m = MODEL_BY_CODE.get(code)
+    return int(m["context"]) if m else FALLBACK_CONTEXT
+
+
+def model_max_output(code: str) -> int:
+    """Потолок генерации модели: предел параметра max_tokens."""
+    m = MODEL_BY_CODE.get(code)
+    return int(m["max_output"]) if m else FALLBACK_MAX_OUTPUT
 
 
 def cost_usd(code: str, prompt_tokens: int, completion_tokens: int) -> float | None:
@@ -105,6 +137,12 @@ EXAMPLES = [
         "title": "Что ты помнишь?",
         "prompt": "Напомни, о чём мы с тобой говорили раньше и что ты успел обо мне узнать.",
         "tools": [],  # инструменты не нужны: ответ берётся из памяти агента
+    },
+    {
+        "title": "Длинный ответ",
+        "prompt": "Расскажи подробно, страницы на полторы, как устроена память ИИ-агента: "
+                  "окно контекста, история на диске, что уходит в модель и почему это стоит денег.",
+        "tools": [],  # инструменты не нужны: смысл примера — большой ответ и рост токенов
     },
     {
         "title": "Точный счёт",
