@@ -56,8 +56,12 @@ ERR_LINE = "#4a1f26"
 ERR_TEXT = "#ff9d9d"
 OK = "#2fbf6b"
 WARN = "#e6b800"
+SUMMARY = "#ff7eb6"   # суммаризация — сжатая память; свой цвет, чтобы отличался от памяти как есть
 
-BUBBLE_ID = {"user": "bubbleUser", "agent": "bubbleAgent", "error": "bubbleError"}
+BUBBLE_ID = {
+    "user": "bubbleUser", "agent": "bubbleAgent", "error": "bubbleError",
+    "shadow": "bubbleShadow",   # теневой ответ «без сжатия» — только для сравнения
+}
 
 QSS = f"""
 QWidget {{
@@ -101,6 +105,8 @@ QFrame#bubbleAgent {{ background: {CARD}; border: 1px solid {LINE}; border-radiu
 QFrame#bubbleAgent QLabel {{ background: transparent; }}
 QFrame#bubbleError {{ background: {ERR_BG}; border: 1px solid {ERR_LINE}; border-radius: 16px; }}
 QFrame#bubbleError QLabel {{ background: transparent; color: {ERR_TEXT}; }}
+QFrame#bubbleShadow {{ background: {PANEL}; border: 1px dashed #3a4356; border-radius: 16px; }}
+QFrame#bubbleShadow QLabel {{ background: transparent; color: #c2c7d0; }}
 QFrame#stat {{ background: {CARD}; border: 1px solid {LINE}; border-radius: 12px; }}
 QFrame#stat QLabel {{ background: transparent; }}
 
@@ -136,6 +142,7 @@ QLabel#traceLabel {{ color: {MUTED}; font-size: 10px; font-weight: 700; letter-s
 QLabel#planItem {{ font-size: 13px; }}
 QLabel#stepHead {{ color: {ACCENT}; font-family: Consolas, monospace; font-size: 12px; }}
 QLabel#stepHeadErr {{ color: {ERR_TEXT}; font-family: Consolas, monospace; font-size: 12px; }}
+QLabel#summaryHead {{ color: {SUMMARY}; font-family: Consolas, monospace; font-size: 12px; }}
 QFrame#stepResult {{ background: {BLACK}; border: 1px solid {LINE}; border-radius: 8px; }}
 QFrame#stepResult QLabel {{
     background: transparent; color: #a9c39a;
@@ -234,6 +241,7 @@ FIXED_PART = "#2f4a86"
 
 PART_COLORS = {
     "инструкция": "#7a5cff",
+    "суммаризация": SUMMARY,
     "память": ACCENT,
     "вопрос": OK,
     "схемы инструментов": WARN,
@@ -257,14 +265,15 @@ class AskWorker(QThread):
     done = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, agent: Agent, message: str) -> None:
+    def __init__(self, agent: Agent, message: str, compare: bool = False) -> None:
         super().__init__()
         self.agent = agent
         self.message = message
+        self.compare = compare   # заодно теневой ответ «без сжатия» для сравнения
 
     def run(self) -> None:
         try:
-            self.done.emit(self.agent.ask(self.message))
+            self.done.emit(self.agent.ask(self.message, compare=self.compare))
         except AgentError as e:
             self.failed.emit(str(e))
 
@@ -433,11 +442,13 @@ class RawDialog(QDialog):
 
 
 class MemoryDialog(QDialog):
-    """История агента целиком и граница окна контекста внутри неё.
+    """История агента целиком и границы внутри неё: суммаризация, очередь, окно контекста.
 
-    Первая вкладка — переписка как диалог: выше границы то, что хранится, ниже —
-    то, что реально уйдёт в модель следующим запросом. Вторая — те же сообщения
-    строками таблицы `messages`, чтобы было видно, что история лежит в базе.
+    Первая вкладка — переписка как диалог с тремя границами: что уже свёрнуто в
+    суммаризацию, что ждёт очереди на неё и что уходит в модель дословно. Вторая —
+    сама суммаризация: текст, версия, что она заменяет и когда обновится. Третья — те же
+    сообщения и версии суммаризации строками таблиц `messages` и `summaries`: видно,
+    что история и суммаризация лежат в базе отдельно друг от друга.
     """
 
     def __init__(self, agent: Agent, parent: QWidget) -> None:
@@ -450,10 +461,16 @@ class MemoryDialog(QDialog):
         p = agent.passport()
         history = agent.transcript()
         weight = agent.tokens_state()
+        summary = weight["summary"]
+        folded = (
+            f" · суммаризация №{summary['version']} вместо {weight['folded_messages']} сообщ.: "
+            f"≈ {_num(weight['folded_tokens'])} → {_num(weight['summary_tokens'])} т."
+            if weight["summary_active"] else ""
+        )
         head = QLabel(
             f"{len(history)} сообщ. ≈ {_num(weight['history_tokens'])} токенов в истории · "
             f"{p['memory_messages']} сообщ. ≈ {_num(weight['breakdown']['memory'])} токенов уйдёт "
-            f"в модель · {p['history_file'] or 'история не ведётся'}"
+            f"в модель как есть{folded} · {p['history_file'] or 'история не ведётся'}"
             if history else "История пуста — агент ещё ничего не запомнил."
         )
         head.setObjectName("note")
@@ -461,21 +478,40 @@ class MemoryDialog(QDialog):
         lay.addWidget(head)
 
         chat = ChatView(bubble_max=480)
-        # Граница контекста: всё, что выше, хранится, но в запрос уже не попадёт.
-        edge = len(history) - p["memory_messages"]
+        # Три границы. Что не новее границы суммаризации — свёрнуто; дальше очередь на
+        # суммаризацию (или просто «за окном», если сжатие выключено); хвост — окно.
+        upto = summary["upto"] if weight["summary_active"] else 0
+        folded_count = sum(1 for m in history if (m.get("id") or 0) <= upto) if upto else 0
+        window_start = len(history) - p["memory_messages"]
         for number, m in enumerate(history):
-            if number == edge and edge > 0:
+            if number == 0 and folded_count:
+                chat.add_system(
+                    f"↓ первые {folded_count} сообщ. свёрнуты в суммаризацию №{summary['version']} "
+                    f"(≈ {_num(weight['folded_tokens'])} т. → {_num(weight['summary_tokens'])} т.): "
+                    f"в модель уходит она, а не они"
+                )
+            if number == folded_count and window_start > folded_count:
+                waiting = window_start - folded_count
+                chat.add_system(
+                    f"↓ {waiting} сообщ. ждут суммаризации — она обновится, когда их наберётся "
+                    f"{weight['summary_every']}; пока в модель они не уходят"
+                    if weight["compression"] else
+                    f"↓ {waiting} сообщ. за окном памяти: хранятся, но в модель не уходят "
+                    f"и денег больше не стоят"
+                )
+            if number == window_start and p["memory_messages"]:
                 chat.add_system(
                     f"↓ последние {p['memory_messages']} сообщ. ≈ "
-                    f"{_num(weight['breakdown']['memory'])} токенов — это и есть контекст модели, "
-                    f"всё что выше хранится, но денег больше не стоит"
+                    f"{_num(weight['breakdown']['memory'])} токенов уходят в модель как есть — "
+                    f"это окно контекста"
                 )
             chat.add_bubble(m["content"], "user" if m["role"] == "user" else "agent")
         chat.to_top()
 
         tabs = QTabWidget()
         tabs.addTab(chat, "Диалог")
-        tabs.addTab(_history_table(agent.id, history), "В базе")
+        tabs.addTab(_summary_page(weight), "Суммаризация")
+        tabs.addTab(_history_table(agent.id, history, agent.summaries()), "В базе")
         lay.addWidget(tabs)
 
 
@@ -568,13 +604,26 @@ class ContextBar(QFrame):
             f"окно модели {_num(state['limit'])} · занято {fill * 100:.2f}% · "
             f"запас под ответ {_num(state['reserve'])}"
         )
-        self.history_line.setText(
-            f"вся история: {state['history_messages']} сообщ. ≈ {_num(state['history_tokens'])} т. · "
-            f"в модель уходит {state['window_messages']} сообщ."
-        )
+        history = f"вся история: {state['history_messages']} сообщ. ≈ {_num(state['history_tokens'])} т."
+        if state["summary_active"]:
+            waiting = f" · ждут суммаризации: {state['pending_messages']}" if state["pending_messages"] else ""
+            self.history_line.setText(
+                f"{history} · в модель: суммаризация №{state['summary']['version']} вместо "
+                f"{state['folded_messages']} сообщ. (≈ {_num(state['folded_tokens'])} → "
+                f"{_num(state['summary_tokens'])} т.) + {state['window_messages']} сообщ. как есть{waiting}"
+            )
+        elif state["compression"]:
+            self.history_line.setText(
+                f"{history} · в модель уходит {state['window_messages']} сообщ. · суммаризации пока нет: "
+                f"за окном {state['pending_messages']} сообщ. из {state['summary_every']}"
+            )
+        else:
+            self.history_line.setText(
+                f"{history} · в модель уходит {state['window_messages']} сообщ. · сжатие выключено"
+            )
         self.setToolTip(
-            "Считается до отправки: инструкция агента, окно памяти и схемы инструментов уже\n"
-            "известны, значит известен и вес следующего запроса. История хранится целиком,\n"
+            "Считается до отправки: инструкция агента, суммаризация, окно памяти и схемы инструментов\n"
+            "уже известны, значит известен и вес следующего запроса. История хранится целиком,\n"
             "но платим мы только за то, что попадает в окно контекста."
         )
 
@@ -610,9 +659,10 @@ class UsageChart(QFrame):
         left, right, top, bottom = 62, 66, 16, 26
         width = max(1, self.width() - left - right)
         height = max(1, self.height() - top - bottom)
-        # Столбик — это контекст запроса плюс ответ. Контекст разделён надвое:
-        # постоянная часть (инструкция и схемы инструментов платятся в каждом
-        # обращении одинаково) и память диалога — та самая, что растёт.
+        # Столбик — это контекст запроса плюс ответ. Контекст разделён на три части:
+        # постоянная (инструкция и схемы инструментов платятся в каждом обращении
+        # одинаково), суммаризация — сжатое начало разговора, и память как есть — та,
+        # что растёт, пока в дело не вступит суммаризация.
         peak = max(row["context_tokens"] + row["completion_tokens"] for row in self.rows) or 1
         spent, running = [], 0.0
         for row in self.rows:
@@ -627,9 +677,11 @@ class UsageChart(QFrame):
         bar = max(3.0, min(26.0, step * 0.6))
         for number, row in enumerate(self.rows):
             centre = left + step * (number + 0.5)
-            memory = min(row["memory_tokens"], row["context_tokens"])
+            summary = min(row.get("summary_tokens") or 0, row["context_tokens"])
+            memory = min(row["memory_tokens"], row["context_tokens"] - summary)
             blocks = (
-                (row["context_tokens"] - memory, FIXED_PART),  # инструкция, схемы, вопрос
+                (row["context_tokens"] - memory - summary, FIXED_PART),  # инструкция, схемы, вопрос
+                (summary, PART_COLORS["суммаризация"]),          # сжатое начало разговора
                 (memory, PART_COLORS["память"]),             # то, что растёт с диалогом
                 (row["completion_tokens"], OK),              # ответ модели
             )
@@ -705,7 +757,8 @@ class TokensDialog(QDialog):
         legend = QLabel(
             f'<span style="color: {FIXED_PART}">■</span> постоянная часть запроса '
             f'(инструкция и схемы) · '
-            f'<span style="color: {PART_COLORS["память"]}">■</span> память диалога · '
+            f'<span style="color: {PART_COLORS["суммаризация"]}">■</span> суммаризация · '
+            f'<span style="color: {PART_COLORS["память"]}">■</span> память как есть · '
             f'<span style="color: {OK}">■</span> ответ модели · '
             f'<span style="color: {WARN}">—</span> накопленная стоимость'
         )
@@ -731,13 +784,22 @@ class TokensDialog(QDialog):
         lay.addWidget(_section("ИСТОРИЯ ЦЕЛИКОМ И ОКНО КОНТЕКСТА"))
         history = QLabel(
             f"В базе лежит {state['history_messages']} сообщ. — это ≈{_num(state['history_tokens'])} "
-            f"токенов. В модель уходит только окно памяти: {state['window_messages']} сообщ. "
-            f"(≈{_num(state['breakdown']['memory'])} токенов). Разница и есть смысл двухуровневой "
-            f"памяти: разговор хранится целиком, а платим мы только за хвост."
+            f"токенов. В модель как есть уходит только окно памяти: {state['window_messages']} сообщ. "
+            f"(≈{_num(state['breakdown']['memory'])} токенов)"
+            + (f", а вместо {state['folded_messages']} сообщ. до него — суммаризация "
+               f"(≈{_num(state['summary_tokens'])} токенов)" if state["summary_active"] else "")
+            + ". Разница и есть смысл многослойной памяти: разговор хранится целиком, а платим "
+            "мы только за хвост и за короткую суммаризацию."
         )
         history.setObjectName("subtitle")
         history.setWordWrap(True)
         lay.addWidget(history)
+
+        lay.addWidget(_section("СЖАТИЕ ИСТОРИИ: ДО И ПОСЛЕ"))
+        compression = QLabel(_compression_text(state, rows))
+        compression.setObjectName("subtitle")
+        compression.setWordWrap(True)
+        lay.addWidget(compression)
 
         lay.addWidget(_section("ТОЧНОСТЬ СЧЁТЧИКА"))
         accuracy = QLabel(_accuracy_text(calibration))
@@ -1060,8 +1122,41 @@ class AgentWindow(QMainWindow):
         lay.addWidget(_section("ГЛУБИНА ПАМЯТИ, ПАР"))
         self.mem_box = QSpinBox()
         self.mem_box.setRange(0, MEMORY_TURNS_MAX)
+        self.mem_box.setToolTip("Сколько последних пар «вопрос-ответ» уходит в модель дословно.")
         self.mem_box.editingFinished.connect(lambda: self._apply(memory_turns=self.mem_box.value()))
         lay.addWidget(self.mem_box)
+
+        # Сжатие истории: что выпало из окна памяти, копится и сворачивается в
+        # суммаризацию отдельным вызовом модели. Период, как и всё остальное, проверяет
+        # агент — поле пускает любое число, а отказ объясняет он.
+        lay.addWidget(_section("СЖАТИЕ ИСТОРИИ"))
+        self.compress_box = QCheckBox("Суммаризировать старую историю")
+        self.compress_box.setToolTip(
+            "Сообщения, выпавшие из окна памяти, не выбрасываются: когда их набирается\n"
+            "N, агент отдельным вызовом сворачивает их в суммаризацию, и дальше в запрос\n"
+            "вместо них уходит она. Выключено — всё за окном в модель просто не попадает."
+        )
+        self.compress_box.clicked.connect(lambda on: self._apply(compression=on))
+        lay.addWidget(self.compress_box)
+        # В поле только число, единица — в подписи: как у «потолка шагов».
+        every_row = QHBoxLayout()
+        every_row.setSpacing(8)
+        every_label = QLabel("период суммаризации, сообщ.")
+        every_label.setObjectName("agentRole")
+        hint = (
+            "Через сколько сообщений за окном памяти обновлять суммаризацию:\n"
+            "накопилось столько — агент сворачивает их отдельным вызовом.\n"
+            "Границы проверяет агент и объясняет отказ сам."
+        )
+        every_label.setToolTip(hint)
+        self.every_box = QSpinBox()
+        self.every_box.setRange(0, 999)
+        self.every_box.setFixedWidth(72)
+        self.every_box.setToolTip(hint)
+        self.every_box.editingFinished.connect(lambda: self._apply(summary_every=self.every_box.value()))
+        every_row.addWidget(every_label, 1)
+        every_row.addWidget(self.every_box)
+        lay.addLayout(every_row)
 
         # Лимит ответа — настоящий предел генерации у модели. Поставьте маленький
         # и увидите, что бывает при нехватке токенов: ответ обрывается на полуслове.
@@ -1237,13 +1332,24 @@ class AgentWindow(QMainWindow):
         self.input.setObjectName("input")
         self.input.setPlaceholderText("Сообщение агенту…")
         self.input.setFixedHeight(56)
-        self.input.submitted.connect(self._send)
+        self.input.submitted.connect(lambda: self._send())
+        # «Сравнить» — тот же вопрос, но с двумя ответами: настоящий (суммаризация + окно)
+        # и теневой, с полной историей как есть. Рядом видно и качество, и цену.
+        self.compare_btn = _ghost("Сравнить")
+        self.compare_btn.setFixedHeight(56)
+        self.compare_btn.setToolTip(
+            "Ответить как обычно и рядом показать теневой ответ на тот же вопрос\n"
+            "с полной историей вместо суммаризации: два ответа и два счёта в токенах.\n"
+            "В память идёт только настоящий ответ."
+        )
+        self.compare_btn.clicked.connect(lambda: self._send(compare=True))
         self.send_btn = QPushButton("Отправить")
         self.send_btn.setObjectName("send")
         self.send_btn.setFixedHeight(56)
         self.send_btn.setCursor(Qt.PointingHandCursor)
-        self.send_btn.clicked.connect(self._send)
+        self.send_btn.clicked.connect(lambda: self._send())
         comp_lay.addWidget(self.input, 1)
+        comp_lay.addWidget(self.compare_btn)
         comp_lay.addWidget(self.send_btn)
         lay.addWidget(composer)
 
@@ -1289,6 +1395,8 @@ class AgentWindow(QMainWindow):
         self.temp.setValue(round(p["temperature"] * 100))
         self.temp_value.setText(f"{p['temperature']:.2f}")
         self.mem_box.setValue(p["memory_turns"])
+        self.compress_box.setChecked(p["compression"])
+        self.every_box.setValue(p["summary_every"])
         self.tools_box.setChecked(p["tools_enabled"])
         self.plan_box.setChecked(p["planning"])
         self.steps_box.setValue(p["max_steps"])
@@ -1335,13 +1443,38 @@ class AgentWindow(QMainWindow):
         if t:
             b = t.breakdown
             error = f"{t.error_pct:+.1f}%" if t.error_pct is not None else "—"
+            summary = f" + суммаризация {_num(b.summary)}" if b.summary else ""
             outer.addWidget(_wrapped(
-                f"запрос {_num(t.prompt_tokens)} т. = инструкция {_num(b.system)} + память "
+                f"запрос {_num(t.prompt_tokens)} т. = инструкция {_num(b.system)}{summary} + память "
                 f"{_num(b.memory)} + вопрос {_num(b.question)} + схемы {_num(b.tools)} · "
                 f"ответ {_num(t.completion_tokens)} т. · оценка до отправки {_num(t.estimated)} "
                 f"({error}) · контекст занят на {t.fill * 100:.2f}% от {_num(t.limit)}",
                 "meta",
             ))
+
+            # Третья строка — цена сжатия: что заменила суммаризация и сколько весил бы тот
+            # же запрос, уйди история как есть. Это и есть «до/после» на каждом ответе.
+            if t.folded_messages:
+                share = abs(t.saved) / t.uncompressed * 100 if t.uncompressed else 0
+                verdict = (
+                    f"сбережено {_num(t.saved)} т. ({share:.0f}%)" if t.saved >= 0 else
+                    f"пока на {_num(-t.saved)} т. ({share:.0f}%) дороже — суммаризация окупается на длине"
+                )
+                waiting = f" · ждут суммаризации: {t.pending_messages} сообщ." if t.pending_messages else ""
+                line = _wrapped(
+                    f"сжатие: суммаризация №{t.summary_version} вместо {t.folded_messages} сообщ. "
+                    f"≈ {_num(t.folded_tokens)} т. весит {_num(b.summary)} т. · без сжатия запрос был бы "
+                    f"≈ {_num(t.uncompressed)} т.: {verdict}{waiting}",
+                    "meta",
+                )
+                line.setStyleSheet(f"color: {SUMMARY}; font-size: 11px; background: transparent;")
+                outer.addWidget(line)
+            elif t.pending_messages:
+                outer.addWidget(_wrapped(
+                    f"сжатие: за окном памяти {t.pending_messages} сообщ. ≈ {_num(t.pending_tokens)} т. "
+                    f"ждут суммаризации — в этот запрос они не ушли",
+                    "meta",
+                ))
 
             trouble = []
             if t.trimmed_pairs:
@@ -1362,8 +1495,8 @@ class AgentWindow(QMainWindow):
         self.chat.add_row(row)
 
     def _show_trace(self, reply: AgentReply) -> None:
-        """План агента и выполненные шаги — то, чего в чате не бывает."""
-        if not reply.plan and not reply.steps:
+        """План агента, выполненные шаги и сжатие истории — то, чего в чате не бывает."""
+        if not reply.plan and not reply.steps and not reply.compression:
             return
         card = QFrame()
         card.setObjectName("trace")
@@ -1405,7 +1538,75 @@ class AgentWindow(QMainWindow):
                 box_lay.addWidget(result)
                 lay.addWidget(box)
 
+        # Сжатие случается после ответа: выпавшие из окна сообщения набрались на
+        # суммаризацию, и агент ещё одним вызовом свернул их. Показываем саму суммаризацию —
+        # именно она уйдёт в следующий запрос вместо тех сообщений.
+        if reply.compression:
+            c = reply.compression
+            lay.addWidget(_trace_label("СЖАТИЕ ИСТОРИИ"))
+            head = QLabel(
+                f"после ответа: {c.messages} сообщ. ≈ {_num(c.before)} т. свёрнуты в суммаризацию "
+                f"№{c.version} ≈ {_num(c.after)} т.  ·  вызов модели {c.elapsed_s} c, "
+                f"{_num(c.call_tokens)} т."
+            )
+            head.setObjectName("summaryHead")
+            head.setWordWrap(True)
+            lay.addWidget(head)
+            box = QFrame()
+            box.setObjectName("stepResult")
+            box_lay = QVBoxLayout(box)
+            box_lay.setContentsMargins(10, 7, 10, 8)
+            text = QLabel(_clip(c.text, 900))
+            text.setWordWrap(True)
+            text.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            box_lay.addWidget(text)
+            lay.addWidget(box)
+
         self.chat.add(card, Qt.AlignLeft)
+
+    def _show_shadow(self, reply: AgentReply) -> None:
+        """Теневой ответ «без сжатия» под настоящим: два ответа и два счёта рядом."""
+        s, t = reply.shadow, reply.tokens
+        self.chat.add_system(
+            "↓ для сравнения: тот же вопрос, но в модель ушла вся история как есть, а не суммаризация. "
+            "Этот ответ в память не идёт."
+        )
+        self.chat.add_bubble(s.text, "shadow")
+
+        row = QWidget()
+        outer = QVBoxLayout(row)
+        outer.setContentsMargins(6, 0, 0, 4)
+        outer.setSpacing(2)
+        b = s.breakdown
+        cost = f" · {_money(s.cost_usd)}" if s.cost_usd is not None else ""
+        outer.addWidget(_wrapped(
+            f"без сжатия: {s.messages} сообщ. истории · запрос {_num(s.prompt_tokens)} т. = инструкция "
+            f"{_num(b.system)} + память {_num(b.memory)} + вопрос {_num(b.question)} + схемы "
+            f"{_num(b.tools)} · ответ {_num(s.completion_tokens)} т. · {s.elapsed_s} c{cost}",
+            "meta",
+        ))
+        if t:
+            diff = s.prompt_tokens - t.prompt_tokens
+            share = abs(diff) / s.prompt_tokens * 100 if s.prompt_tokens else 0
+            mine = config.cost_usd(reply.model, t.prompt_tokens, t.completion_tokens)
+            money = (
+                f" · стоимость {_money(mine)} против {_money(s.cost_usd)}"
+                if mine is not None and s.cost_usd is not None else ""
+            )
+            verdict = _wrapped(
+                f"со сжатием тот же запрос весил {_num(t.prompt_tokens)} т. — на {_num(abs(diff))} т. "
+                f"({share:.0f}%) {'меньше' if diff >= 0 else 'больше'}{money}",
+                "meta",
+            )
+            verdict.setStyleSheet(f"color: {SUMMARY}; font-size: 11px; background: transparent;")
+            outer.addWidget(verdict)
+        if s.trimmed_pairs:
+            warning = _wrapped(
+                f"⚠ даже полная история не влезла в окно модели: выброшено {s.trimmed_pairs} пар(ы)", "meta"
+            )
+            warning.setStyleSheet(f"color: {WARN}; font-size: 11px; background: transparent;")
+            outer.addWidget(warning)
+        self.chat.add_row(row)
 
     # ------------------------------------------------------- несколько агентов --
 
@@ -1494,12 +1695,17 @@ class AgentWindow(QMainWindow):
         when = _when(p["last_seen_at"])
         if p["restored"]:
             weight = self.agent.tokens_state()
+            folded = (
+                f" Начало разговора ({weight['folded_messages']} сообщ.) свёрнуто в суммаризацию "
+                f"№{weight['summary']['version']} ≈ {_num(weight['summary_tokens'])} токенов — она тоже "
+                f"поднята из базы и уйдёт в модель." if weight["summary_active"] else ""
+            )
             self.chat.add_system(
                 f"Разговор восстановлен из истории: {len(messages)} сообщ. ≈ "
                 f"{_num(weight['history_tokens'])} токенов, последний раз говорили {when}. "
                 f"Агент продолжает с того же места — в модель уйдут последние "
                 f"{p['memory_messages']} сообщ. ≈ {_num(weight['breakdown']['memory'])} токенов "
-                f"(глубина памяти {_plural(p['memory_turns'], 'пара', 'пары', 'пар')})."
+                f"(глубина памяти {_plural(p['memory_turns'], 'пара', 'пары', 'пар')}).{folded}"
             )
         else:
             self.chat.add_system(
@@ -1536,6 +1742,7 @@ class AgentWindow(QMainWindow):
         self.avatar.setFixedSize(round(44 * scale), round(44 * scale))
         self.input.setFixedHeight(round(56 * scale))
         self.send_btn.setFixedHeight(round(56 * scale))
+        self.compare_btn.setFixedHeight(round(56 * scale))
         self.examples.setFixedHeight(round(52 * scale))
         self.agent_bar.setFixedHeight(round(52 * scale))
         self.dot.setFixedSize(round(9 * scale), round(9 * scale))
@@ -1550,7 +1757,7 @@ class AgentWindow(QMainWindow):
 
     # --------------------------------------------------------------- действия --
 
-    def _send(self) -> None:
+    def _send(self, compare: bool = False) -> None:
         text = self.input.toPlainText().strip()
         if not text or self.busy:
             return
@@ -1560,10 +1767,11 @@ class AgentWindow(QMainWindow):
 
         self.busy = True
         self.send_btn.setEnabled(False)
-        self._set_status(WARN, "агент думает…")
+        self.compare_btn.setEnabled(False)
+        self._set_status(WARN, "агент думает и сравнивает…" if compare else "агент думает…")
 
-        # Пока обращение идёт, кнопка выключена — двух одновременных не бывает.
-        self.worker = AskWorker(self.agent, text)
+        # Пока обращение идёт, кнопки выключены — двух одновременных не бывает.
+        self.worker = AskWorker(self.agent, text, compare)
         self.worker.done.connect(self._on_reply)
         self.worker.failed.connect(self._on_error)
         self.worker.start()
@@ -1572,6 +1780,8 @@ class AgentWindow(QMainWindow):
         self._pending.set_text(reply.text)
         self._show_meta(reply)
         self._show_trace(reply)
+        if reply.shadow:
+            self._show_shadow(reply)
         self._set_status(OK, "готов")
         self._finish()
 
@@ -1584,6 +1794,7 @@ class AgentWindow(QMainWindow):
     def _finish(self) -> None:
         self.busy = False
         self.send_btn.setEnabled(True)
+        self.compare_btn.setEnabled(True)
         self._refresh()
         self.input.setFocus()
 
@@ -1643,11 +1854,13 @@ def _wrapped(text: str, name: str) -> QLabel:
     return label
 
 
-def _history_table(agent_id: str, history: list[dict]) -> QPlainTextEdit:
-    """Сообщения так, как они лежат в базе: строка таблицы — строка текста.
+def _history_table(agent_id: str, history: list[dict], summaries: list[dict] = ()) -> QPlainTextEdit:
+    """Сообщения и суммаризации так, как они лежат в базе: строка таблицы — строка текста.
 
     Базу не откроешь блокнотом, поэтому её содержимое показываем прямо в окне:
-    видно, что каждое сообщение — отдельная запись со своим номером и временем.
+    видно, что каждое сообщение — отдельная запись со своим номером и временем, а
+    суммаризация — отдельная таблица, по строке на версию, и сообщения в истории от неё
+    не меняются.
     """
     lines = [
         "sqlite> SELECT id, role, at, content FROM messages",
@@ -1665,6 +1878,31 @@ def _history_table(agent_id: str, history: list[dict]) -> QPlainTextEdit:
     if not history:
         lines.append("-- строк нет")
 
+    lines += [
+        "",
+        "sqlite> SELECT version, turn, upto, folded_messages, folded_tokens, summary_tokens, content",
+        f"        FROM summaries WHERE agent_id = '{agent_id}' ORDER BY id;",
+        "",
+        f"{'вер.':>4}  {'обр.':>4}  {'upto':>5}  {'сообщ.':>6}  {'весили':>7}  {'весит':>6}  content",
+        f"{'-' * 4}  {'-' * 4}  {'-' * 5}  {'-' * 6}  {'-' * 7}  {'-' * 6}  {'-' * 40}",
+    ]
+    for row in summaries:
+        text = " ".join((row.get("content") or "").split())
+        if len(text) > 96:
+            text = text[:96] + "…"
+        lines.append(
+            f"{row['version']:>4}  {row['turn']:>4}  {row['upto']:>5}  {row['folded_messages']:>6}  "
+            f"{row['folded_tokens']:>7}  {row['summary_tokens']:>6}  {text}"
+        )
+    if not summaries:
+        lines.append("-- строк нет: суммаризация ещё не составлялась")
+    else:
+        lines += [
+            "",
+            "-- «upto» — id последнего сообщения, вошедшего в суммаризацию; «сообщ.» — сколько она",
+            "-- заменяет всего, «весили» — сколько они стоили бы в запросе, «весит» — сама суммаризация.",
+        ]
+
     view = QPlainTextEdit("\n".join(lines))
     view.setObjectName("raw")
     view.setReadOnly(True)
@@ -1672,16 +1910,84 @@ def _history_table(agent_id: str, history: list[dict]) -> QPlainTextEdit:
     return view
 
 
+def _summary_page(state: dict) -> QWidget:
+    """Вкладка «Суммаризация»: сам текст, что она заменяет и когда обновится."""
+    page = QWidget()
+    lay = QVBoxLayout(page)
+    lay.setContentsMargins(0, 10, 0, 0)
+    lay.setSpacing(8)
+
+    summary = state["summary"]
+    if not state["compression"]:
+        text = ("Сжатие выключено: всё, что выпадает из окна памяти, в модель просто не уходит. "
+                + (f"Суммаризация №{summary['version']} ({summary['messages']} сообщ.) сохранена и вернётся "
+                   f"в запрос, как только сжатие включат." if summary["version"] else ""))
+    elif not summary["version"]:
+        text = (f"Суммаризации пока нет. Она появится, когда за окном памяти накопится "
+                f"{state['summary_every']} сообщ.: сейчас там {state['pending_messages']}.")
+    else:
+        text = (
+            f"Суммаризация №{summary['version']} · вместо {summary['messages']} сообщ. ≈ "
+            f"{_num(summary['tokens'])} т. · сама весит ≈ {_num(state['summary_tokens'])} т. вместе с "
+            f"заметкой, которая объясняет модели, что это её память · обновлена {_when(summary['at'])} · "
+            f"следующее обновление, когда за окном накопится {state['summary_every']} сообщ. "
+            f"(сейчас {state['pending_messages']})"
+        )
+    note = QLabel(text)
+    note.setObjectName("note")
+    note.setWordWrap(True)
+    lay.addWidget(note)
+
+    view = QPlainTextEdit(summary["text"] or "— суммаризация пуста —")
+    view.setObjectName("raw")
+    view.setReadOnly(True)
+    lay.addWidget(view, 1)
+    return page
+
+
+def _compression_text(state: dict, rows: list[dict]) -> str:
+    """Сжатие словами: что заменила суммаризация, сколько сберегла сейчас и за всё время."""
+    if not state["compression"]:
+        return ("Сжатие выключено: сообщения за окном памяти в запрос не попадают вовсе — дёшево, "
+                "но начало разговора агент не помнит. Включите его в панели, и всё, что за окном, "
+                "встанет в очередь на суммаризацию.")
+    summary = state["summary"]
+    if not summary["version"]:
+        return (f"Суммаризации пока нет: за окном памяти {state['pending_messages']} сообщ., она составится, "
+                f"когда их наберётся {state['summary_every']}. Пока разговор короче окна, сжимать нечего.")
+    saved_total = sum((row.get("folded_tokens") or 0) - (row.get("summary_tokens") or 0) for row in rows)
+    before, after = state["uncompressed"], state["context_tokens"]
+    share = abs(before - after) / before * 100 if before else 0
+    now = (
+        f"дешевле на {share:.0f}%" if before >= after else
+        f"пока дороже на {share:.0f}%: суммаризация вместе с заметкой тяжелее тех нескольких сообщений, "
+        f"что заменила, и окупается на длине разговора"
+    )
+    total = (
+        f"За все обращения суммаризация сберегла ≈{_num(saved_total)} токенов" if saved_total >= 0 else
+        f"За все обращения суммаризация пока обошлась на ≈{_num(-saved_total)} токенов дороже сообщений"
+    )
+    return (
+        f"Суммаризация №{summary['version']} заменяет {summary['messages']} сообщ. (≈{_num(summary['tokens'])} "
+        f"токенов) и весит ≈{_num(state['summary_tokens'])} — вместе с заметкой, которая объясняет "
+        f"модели, что это её память. Следующий запрос со сжатием ≈{_num(after)} токенов, без сжатия "
+        f"он весил бы ≈{_num(before)} — {now}. {total}: сумма по строкам расхода, что весили бы "
+        f"свёрнутые сообщения минус вес суммаризации. Само обновление суммаризации — отдельный вызов "
+        f"модели, его токены входят в расход того обращения, после которого он случился."
+    )
+
+
 def _usage_table(agent_id: str, rows: list[dict]) -> QPlainTextEdit:
     """Расход так, как он лежит в базе: строка таблицы `usage` — строка текста."""
     lines = [
         "sqlite> SELECT turn, llm_calls, prompt_tokens, completion_tokens, cost_usd,",
-        "               context_tokens, estimated FROM usage",
+        "               context_tokens, summary_tokens, folded_messages, estimated FROM usage",
         f"        WHERE agent_id = '{agent_id}' ORDER BY id;",
         "",
         f"{'обр.':>5} {'выз.':>5} {'запрос':>8} {'ответ':>7} {'стоимость':>10} "
-        f"{'накоплено':>10} {'контекст':>9} {'оценка':>8} {'расх.':>7}",
-        f"{'-' * 5} {'-' * 5} {'-' * 8} {'-' * 7} {'-' * 10} {'-' * 10} {'-' * 9} {'-' * 8} {'-' * 7}",
+        f"{'накоплено':>10} {'контекст':>9} {'суммаризация':>12} {'вместо':>6} {'оценка':>8} {'расх.':>7}",
+        f"{'-' * 5} {'-' * 5} {'-' * 8} {'-' * 7} {'-' * 10} {'-' * 10} {'-' * 9} {'-' * 12} {'-' * 6} "
+        f"{'-' * 8} {'-' * 7}",
     ]
     running = 0.0
     for row in rows:
@@ -1691,15 +1997,17 @@ def _usage_table(agent_id: str, rows: list[dict]) -> QPlainTextEdit:
         lines.append(
             f"{row['turn']:>5} {row['llm_calls']:>5} {row['prompt_tokens']:>8} "
             f"{row['completion_tokens']:>7} {_money(row['cost_usd']):>10} {_money(running):>10} "
-            f"{actual:>9} {estimated:>8} {error:>7}"
+            f"{actual:>9} {row.get('summary_tokens') or 0:>12} {row.get('folded_messages') or 0:>6} "
+            f"{estimated:>8} {error:>7}"
         )
     if not rows:
         lines.append("-- строк нет: агент ещё не потратил ни одного токена")
     else:
         lines += [
             "",
-            "-- «запрос» и «ответ» — факт по всем вызовам обращения (план, шаги, итог),",
-            "-- «контекст» — вес первого запроса, «оценка» — что счётчик обещал до отправки.",
+            "-- «запрос» и «ответ» — факт по всем вызовам обращения (план, шаги, итог, суммаризация,",
+            "-- теневой ответ), «контекст» — вес первого запроса, «суммаризация» — сколько в нём заняла",
+            "-- суммаризация и «вместо» скольких сообщений, «оценка» — что счётчик обещал до отправки.",
         ]
 
     view = QPlainTextEdit("\n".join(lines))
@@ -1731,6 +2039,9 @@ def _forecast_text(state: dict, rows: list[dict]) -> str:
            "«вопрос-ответ»: в базе они сохранятся, но в модель уже не уйдут — начало разговора " \
            "агент забудет. Запрос, который не помещается даже без памяти, он отклонит сам, " \
            "не тратя вызов."
+    if state["compression"]:
+        tail = "Со сжатием окно памяти не растёт: старое уходит в суммаризацию, а суммаризация держится " \
+               "примерно одного размера, поэтому до потолка дело обычно не доходит. " + tail
     dropped = sum(row["trimmed_pairs"] for row in rows)
     if dropped:
         tail += f" Пар, уже выброшенных из окна за всё время: {dropped}."

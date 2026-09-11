@@ -9,13 +9,16 @@
 хранения — правка одного этого файла, агент её не замечает.
 
 База — SQLite (`data/agents.db`), она встроена в Python, отдельный сервер и новые
-зависимости не нужны. Три таблицы:
+зависимости не нужны. Четыре таблицы:
 
-    agents    id, created_at, turns, active + паспорт (name/role/instructions)
-              и настройки (model, temperature, memory_turns, tools_enabled, …)
-    messages  id, agent_id, role, content, at — по строке на сообщение
-    usage     id, agent_id, turn, at + токены, стоимость и вес контекста —
-              по строке на обращение: из неё видно, как дорожает разговор
+    agents     id, created_at, turns, active + паспорт (name/role/instructions)
+               и настройки (model, temperature, memory_turns, compression, …)
+    messages   id, agent_id, role, content, at — по строке на сообщение
+    summaries  id, agent_id, version, at, turn, upto + сколько сообщений заменяет
+               и текст суммаризации — по строке на версию: суммаризация хранится
+               отдельно от истории, сообщения в ней остаются как были
+    usage      id, agent_id, turn, at + токены, стоимость и вес контекста —
+               по строке на обращение: из неё видно, как дорожает разговор
 
 Почему база, а не файл целиком: сообщение дописывается одной строкой (INSERT), а
 не переписыванием всей истории, обращение фиксируется транзакцией (на диске либо
@@ -38,7 +41,7 @@ from . import config
 
 logger = logging.getLogger("app.store")
 
-VERSION = 2  # версия схемы, хранится в PRAGMA user_version
+VERSION = 3  # версия схемы, хранится в PRAGMA user_version
 
 # Колонки таблицы agents: отсюда собирается и CREATE TABLE, и мягкая миграция.
 # Появится новая настройка — колонка допишется в существующую базу сама; объявляй
@@ -58,6 +61,8 @@ AGENT_COLUMNS = {
     "tools_enabled": "INTEGER NOT NULL DEFAULT 1",
     "planning": "INTEGER NOT NULL DEFAULT 1",
     "max_steps": "INTEGER",
+    "compression": "INTEGER NOT NULL DEFAULT 1",  # сворачивать ли старое в суммаризацию
+    "summary_every": "INTEGER",                   # сообщений за окном до обновления суммаризации
 }
 
 MESSAGES_SCHEMA = """
@@ -92,9 +97,31 @@ USAGE_COLUMNS = {
     "memory_tokens": "INTEGER NOT NULL DEFAULT 0",       # из них память диалога
     "context_limit": "INTEGER NOT NULL DEFAULT 0",       # окно модели на тот момент
     "trimmed_pairs": "INTEGER NOT NULL DEFAULT 0",       # сколько пар памяти выброшено
+    "summary_tokens": "INTEGER NOT NULL DEFAULT 0",      # из контекста — суммаризация
+    "folded_messages": "INTEGER NOT NULL DEFAULT 0",     # сколько сообщений она заменяла
+    "folded_tokens": "INTEGER NOT NULL DEFAULT 0",       # сколько они весили бы сами
+    "shadow_tokens": "INTEGER NOT NULL DEFAULT 0",       # теневой вызов для сравнения
 }
 
 USAGE_INDEX = "CREATE INDEX IF NOT EXISTS usage_by_agent ON usage(agent_id, id)"
+
+# Суммаризации: по строке на версию. Отдельная таблица, а не колонка в agents, потому
+# что суммаризация — это данные разговора, а не настройка: у неё есть история версий,
+# граница в сообщениях и свой вес, и стереть его нужно вместе с перепиской.
+SUMMARY_COLUMNS = {
+    "id": "INTEGER PRIMARY KEY",
+    "agent_id": "TEXT NOT NULL",
+    "version": "INTEGER NOT NULL DEFAULT 0",         # сколько раз суммаризация обновлялась
+    "at": "REAL NOT NULL DEFAULT 0",
+    "turn": "INTEGER NOT NULL DEFAULT 0",            # после какого обращения свёрнут
+    "upto": "INTEGER NOT NULL DEFAULT 0",            # id последнего сообщения, вошедшего в суммаризацию
+    "folded_messages": "INTEGER NOT NULL DEFAULT 0", # сколько сообщений заменяет (всего)
+    "folded_tokens": "INTEGER NOT NULL DEFAULT 0",   # сколько они весили бы в запросе (оценка)
+    "summary_tokens": "INTEGER NOT NULL DEFAULT 0",  # сколько весит сама суммаризация
+    "content": "TEXT NOT NULL DEFAULT ''",
+}
+
+SUMMARY_INDEX = "CREATE INDEX IF NOT EXISTS summaries_by_agent ON summaries(agent_id, id)"
 
 
 class Store:
@@ -137,27 +164,30 @@ class Store:
         with self._connect() as conn:
             agents = conn.execute("SELECT COUNT(*) FROM agents").fetchone()[0]
             messages = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+            summaries = conn.execute("SELECT COUNT(*) FROM summaries").fetchone()[0]
             spent = conn.execute("SELECT COALESCE(SUM(total_tokens), 0) FROM usage").fetchone()[0]
         logger.info(
-            "Состояние: %d агент(ов), %d сообщ., %d токен(ов) израсходовано · %s",
-            agents, messages, spent, self.path,
+            "Состояние: %d агент(ов), %d сообщ., %d версий суммаризаций, %d токен(ов) израсходовано · %s",
+            agents, messages, summaries, spent, self.path,
         )
 
     def _create_schema(self) -> None:
         agents = ", ".join(f"{name} {declaration}" for name, declaration in AGENT_COLUMNS.items())
         usage = ", ".join(f"{name} {declaration}" for name, declaration in USAGE_COLUMNS.items())
+        summaries = ", ".join(f"{name} {declaration}" for name, declaration in SUMMARY_COLUMNS.items())
+        cascade = "FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE"
         with self._connect() as conn:
             conn.execute(f"CREATE TABLE IF NOT EXISTS agents ({agents})")
             conn.executescript(MESSAGES_SCHEMA)
             # Внешний ключ дописан отдельной строкой: ALTER TABLE его добавить не
             # умеет, а таблица целиком создаётся и в базе от прошлой версии.
-            conn.execute(
-                f"CREATE TABLE IF NOT EXISTS usage ({usage}, "
-                f"FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE)"
-            )
+            conn.execute(f"CREATE TABLE IF NOT EXISTS usage ({usage}, {cascade})")
             conn.execute(USAGE_INDEX)
+            conn.execute(f"CREATE TABLE IF NOT EXISTS summaries ({summaries}, {cascade})")
+            conn.execute(SUMMARY_INDEX)
             self._add_new_columns(conn, "agents", AGENT_COLUMNS)
             self._add_new_columns(conn, "usage", USAGE_COLUMNS)
+            self._add_new_columns(conn, "summaries", SUMMARY_COLUMNS)
             conn.execute(f"PRAGMA user_version = {VERSION}")
 
     @staticmethod
@@ -251,6 +281,22 @@ class Store:
             ).fetchone()
         return row["at"] if row else None
 
+    def summary(self, agent_id: str) -> dict | None:
+        """Действующая суммаризация агента — последняя версия (None, если суммаризации нет)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM summaries WHERE agent_id = ? ORDER BY id DESC LIMIT 1", (agent_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def summaries(self, agent_id: str) -> list[dict]:
+        """Все версии суммаризации по порядку: видно, как она росла вместе с разговором."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM summaries WHERE agent_id = ? ORDER BY id", (agent_id,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     # --------------------------------------------------------------- запись --
 
     def save_agent(self, state: dict) -> None:
@@ -258,18 +304,31 @@ class Store:
         with self._connect() as conn:
             self._upsert(conn, state)
 
-    def save_turn(self, state: dict, messages: list[dict], usage: dict | None = None) -> None:
+    def save_turn(self, state: dict, messages: list[dict], usage: dict | None = None) -> list[int]:
         """Зафиксировать обращение: сообщения, состояние и расход — одной транзакцией.
 
         Одной транзакцией, потому что иначе счётчик обращений, история и расход
         токенов разъедутся: строка в `usage` без своей пары сообщений врала бы про
-        цену разговора.
+        цену разговора. Возвращает id записанных сообщений: по ним агент отличает,
+        что из истории уже свёрнуто в суммаризацию, а что ещё нет.
         """
         with self._connect() as conn:
             self._upsert(conn, state)
-            self._append(conn, state["id"], messages)
+            ids = self._append(conn, state["id"], messages)
             if usage:
                 self._spend(conn, state["id"], usage)
+        return ids
+
+    def save_summary(self, agent_id: str, summary: dict) -> None:
+        """Записать новую версию суммаризации (старые остаются — это её история)."""
+        row = {name: summary[name] for name in SUMMARY_COLUMNS
+               if name in summary and name not in ("id", "agent_id", "at")}
+        row["agent_id"] = agent_id
+        row["at"] = time.time()
+        columns = ", ".join(row)
+        marks = ", ".join(f":{name}" for name in row)
+        with self._connect() as conn:
+            conn.execute(f"INSERT INTO summaries ({columns}) VALUES ({marks})", row)
 
     def set_active(self, agent_id: str) -> None:
         """Запомнить, с кем продолжать разговор при следующем запуске."""
@@ -277,9 +336,10 @@ class Store:
             conn.execute("UPDATE agents SET active = (id = ?)", (agent_id,))
 
     def forget(self, agent_id: str) -> None:
-        """Стереть переписку агента и её расход, оставив агента с его настройками."""
+        """Стереть переписку агента, её суммаризации и расход, оставив агента с настройками."""
         with self._connect() as conn:
             conn.execute("DELETE FROM messages WHERE agent_id = ?", (agent_id,))
+            conn.execute("DELETE FROM summaries WHERE agent_id = ?", (agent_id,))
             conn.execute("DELETE FROM usage WHERE agent_id = ?", (agent_id,))
         logger.info("История агента [%s] стёрта", agent_id)
 
@@ -309,13 +369,16 @@ class Store:
         )
 
     @staticmethod
-    def _append(conn: sqlite3.Connection, agent_id: str, messages: list[dict]) -> None:
+    def _append(conn: sqlite3.Connection, agent_id: str, messages: list[dict]) -> list[int]:
         """Дописать сообщения в историю агента, удержав её в пределах лимита."""
         now = time.time()
-        conn.executemany(
-            "INSERT INTO messages (agent_id, role, content, at) VALUES (?, ?, ?, ?)",
-            [(agent_id, m["role"], m["content"], now) for m in messages],
-        )
+        ids = []
+        for m in messages:
+            cursor = conn.execute(
+                "INSERT INTO messages (agent_id, role, content, at) VALUES (?, ?, ?, ?)",
+                (agent_id, m["role"], m["content"], now),
+            )
+            ids.append(cursor.lastrowid)
         # Истории нужен потолок: самые старые сообщения уходят первыми — в контекст
         # модели они всё равно уже не попадают.
         conn.execute(
@@ -323,6 +386,7 @@ class Store:
             "    SELECT id FROM messages WHERE agent_id = ? ORDER BY id DESC LIMIT ?)",
             (agent_id, agent_id, config.HISTORY_LIMIT),
         )
+        return ids
 
     @staticmethod
     def _spend(conn: sqlite3.Connection, agent_id: str, usage: dict) -> None:
@@ -355,6 +419,8 @@ def _row(state: dict) -> dict:
         "tools_enabled": int(bool(settings.get("tools_enabled"))),
         "planning": int(bool(settings.get("planning"))),
         "max_steps": settings.get("max_steps"),
+        "compression": int(bool(settings.get("compression", True))),
+        "summary_every": settings.get("summary_every"),
     }
 
 
@@ -377,5 +443,7 @@ def _state(row: sqlite3.Row) -> dict:
             "tools_enabled": bool(row["tools_enabled"]),
             "planning": bool(row["planning"]),
             "max_steps": row["max_steps"],
+            "compression": bool(row["compression"]),
+            "summary_every": row["summary_every"],
         },
     }

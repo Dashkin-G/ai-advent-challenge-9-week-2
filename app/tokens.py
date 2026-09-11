@@ -182,21 +182,25 @@ class Breakdown:
 
     Ровно это и объясняет поведение агента: инструкция и схемы инструментов
     платятся в каждом обращении, память растёт с диалогом, а сам вопрос
-    пользователя — обычно самая маленькая часть счёта.
+    пользователя — обычно самая маленькая часть счёта. Суммаризация — это сжатая
+    память: она лежит внутри system-сообщения, но считается отдельно, потому что
+    его цена и есть цена сжатия.
     """
     system: int = 0
+    summary: int = 0
     memory: int = 0
     question: int = 0
     tools: int = 0
 
     @property
     def total(self) -> int:
-        return self.system + self.memory + self.question + self.tools
+        return self.system + self.summary + self.memory + self.question + self.tools
 
     def parts(self) -> list[tuple[str, int]]:
         """Части в порядке показа — интерфейсу удобно рисовать их полосой."""
         return [
             ("инструкция", self.system),
+            ("суммаризация", self.summary),
             ("память", self.memory),
             ("вопрос", self.question),
             ("схемы инструментов", self.tools),
@@ -205,6 +209,7 @@ class Breakdown:
     def to_dict(self) -> dict:
         return {
             "system": self.system,
+            "summary": self.summary,
             "memory": self.memory,
             "question": self.question,
             "tools": self.tools,
@@ -218,11 +223,20 @@ def measure(
     question: str = "",
     tool_specs: list[dict] | None = None,
     model: str | None = None,
+    summary: str = "",
 ) -> Breakdown:
-    """Оценить будущий запрос по частям, с поправкой на токенайзер модели."""
+    """Оценить будущий запрос по частям, с поправкой на токенайзер модели.
+
+    `summary` — суммаризация, уже вписанная в `system`: её вес вычитается из
+    инструкции и показывается отдельной частью. Сумма частей при этом остаётся
+    весом целого запроса.
+    """
     fix = calibration(model)
+    whole = count_message({"role": "system", "content": system}) + REQUEST_OVERHEAD
+    folded = min(whole, count(summary)) if summary else 0
     return Breakdown(
-        system=fix.apply(count_message({"role": "system", "content": system}) + REQUEST_OVERHEAD),
+        system=fix.apply(whole - folded),
+        summary=fix.apply(folded),
         memory=fix.apply(sum(count_message(m) for m in memory)),
         question=fix.apply(count_message({"role": "user", "content": question})) if question else 0,
         tools=fix.apply(count_tools(tool_specs)),
@@ -232,6 +246,11 @@ def measure(
 def measure_messages(messages: list[dict], model: str | None = None) -> int:
     """Оценить набор сообщений без обвязки запроса — например, окно памяти."""
     return calibration(model).apply(sum(count_message(m) for m in messages))
+
+
+def measure_text(text: str, model: str | None = None) -> int:
+    """Оценить кусок текста с поправкой модели — например, сама суммаризация."""
+    return calibration(model).apply(count(text)) if text else 0
 
 
 def measure_request(
