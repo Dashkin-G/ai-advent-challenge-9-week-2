@@ -182,25 +182,27 @@ class Breakdown:
 
     Ровно это и объясняет поведение агента: инструкция и схемы инструментов
     платятся в каждом обращении, память растёт с диалогом, а сам вопрос
-    пользователя — обычно самая маленькая часть счёта. Суммаризация — это сжатая
-    память: она лежит внутри system-сообщения, но считается отдельно, потому что
-    его цена и есть цена сжатия.
+    пользователя — обычно самая маленькая часть счёта. Суммаризация и факты — это
+    сжатая память двух разных стратегий: они лежат внутри system-сообщения, но
+    считаются отдельно, потому что их цена и есть цена стратегии.
     """
     system: int = 0
     summary: int = 0
+    facts: int = 0
     memory: int = 0
     question: int = 0
     tools: int = 0
 
     @property
     def total(self) -> int:
-        return self.system + self.summary + self.memory + self.question + self.tools
+        return self.system + self.summary + self.facts + self.memory + self.question + self.tools
 
     def parts(self) -> list[tuple[str, int]]:
         """Части в порядке показа — интерфейсу удобно рисовать их полосой."""
         return [
             ("инструкция", self.system),
             ("суммаризация", self.summary),
+            ("факты", self.facts),
             ("память", self.memory),
             ("вопрос", self.question),
             ("схемы инструментов", self.tools),
@@ -210,6 +212,7 @@ class Breakdown:
         return {
             "system": self.system,
             "summary": self.summary,
+            "facts": self.facts,
             "memory": self.memory,
             "question": self.question,
             "tools": self.tools,
@@ -224,19 +227,22 @@ def measure(
     tool_specs: list[dict] | None = None,
     model: str | None = None,
     summary: str = "",
+    facts: str = "",
 ) -> Breakdown:
     """Оценить будущий запрос по частям, с поправкой на токенайзер модели.
 
-    `summary` — суммаризация, уже вписанная в `system`: её вес вычитается из
-    инструкции и показывается отдельной частью. Сумма частей при этом остаётся
-    весом целого запроса.
+    `summary` и `facts` — блоки стратегии, уже вписанные в `system`: их вес
+    вычитается из инструкции и показывается отдельными частями. Сумма частей при
+    этом остаётся весом целого запроса.
     """
     fix = calibration(model)
     whole = count_message({"role": "system", "content": system}) + REQUEST_OVERHEAD
     folded = min(whole, count(summary)) if summary else 0
+    sticky = min(whole - folded, count(facts)) if facts else 0
     return Breakdown(
-        system=fix.apply(whole - folded),
+        system=fix.apply(whole - folded - sticky),
         summary=fix.apply(folded),
+        facts=fix.apply(sticky),
         memory=fix.apply(sum(count_message(m) for m in memory)),
         question=fix.apply(count_message({"role": "user", "content": question})) if question else 0,
         tools=fix.apply(count_tools(tool_specs)),

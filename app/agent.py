@@ -16,9 +16,10 @@
        дальше — до финального ответа или до потолка шагов
     5. разбор ответа и сверка оценки токенов с фактическим `usage`
     6. запись в память, в историю на диске и в расход токенов (в памяти только
-       вопрос и итоговый ответ, без служебной переписки с инструментами); если
-       из окна памяти выпало достаточно сообщений — они сворачиваются в суммаризацию
-       ещё одним вызовом модели
+       вопрос и итоговый ответ, без служебной переписки с инструментами); дальше
+       слово стратегии контекста и сжатия: факты обновляют свой блок
+       «ключ — значение», суммаризация сворачивает выпавшее из окна ещё одним
+       вызовом модели
 
 Именно шаг 4 отличает агента от чата: одна фраза пользователя разворачивается в
 последовательность действий, которые агент выбирает и выполняет сам.
@@ -28,15 +29,30 @@
 фактическим `usage` из ответа, расхождение уходит в калибровку, а расход каждого
 обращения ложится в хранилище — по нему видно, как дорожает разговор.
 
-Память трёхслойная. В `_memory` живёт окно контекста — последние `memory_turns`
-пар «вопрос-ответ» как есть, ровно то, что уходит в модель дословно. Что из окна
-выпало, копится в `_pending` и, когда набирается `summary_every` сообщений,
-сворачивается в суммаризацию (`_summary`) — короткий список фактов, который уходит в
-запрос вместо самих сообщений: так разговор любой длины стоит примерно одинаково.
-Полная переписка вместе с суммаризацией, паспортом и настройками пишется в
-хранилище (`store.py`), поэтому агент не начинает с нуля после перезапуска
-приложения: `load_agents()` поднимает тех же агентов с их историей, и разговор
-продолжается так, будто его не прерывали.
+Память устроена слоями. В `_memory` живёт окно контекста — последние
+`memory_turns` пар «вопрос-ответ» как есть, ровно то, что уходит в модель
+дословно. Что делать с остальным, решает стратегия контекста (`strategy`):
+
+    window    скользящее окно (Sliding Window) — всё, что выпало из окна,
+              отбрасывается;
+    facts     факты (Sticky Facts / Key-Value Memory): после каждого ответа
+              отдельный вызов обновляет блок «ключ — значение» (`_facts`): цель,
+              ограничения, предпочтения, решения, договорённости; в запрос уходят
+              факты + окно;
+    branches  ветки диалога (Branching): точка ветвления фиксирует место, от неё
+              создаются ветки, каждая продолжается независимо; в модель уходит
+              окно активной ветки.
+
+Поверх любой из них включается сжатие истории (`summarize`) — это не стратегия, а
+опция: выпавшее из окна копится в `_pending_summary` и каждые `summary_every`
+сообщений сворачивается в суммаризацию (`_summary`), которая уходит в запрос
+вместо самих сообщений. Поэтому сочетания работают вместе: «факты + суммаризация»,
+«ветки + суммаризация» и так далее.
+
+Полная переписка каждой ветки вместе с суммаризациями, фактами, паспортом и
+настройками пишется в хранилище (`store.py`), поэтому агент не начинает с нуля
+после перезапуска приложения: `load_agents()` поднимает тех же агентов с их
+историей, и разговор продолжается так, будто его не прерывали.
 
 Всё вокруг агента намеренно «глупое»: `llm.py` умеет только сходить в HTTP API
 модели, `tools.py` — только выполнить работу, `store.py` — только положить
@@ -51,7 +67,7 @@ import uuid
 from dataclasses import dataclass, field
 
 from . import config, llm, tokens, tools
-from .store import Store
+from .store import MAIN_BRANCH, Store
 
 logger = logging.getLogger("app.agent")
 
@@ -144,6 +160,36 @@ SUMMARY_SYSTEM = (
 
 SUMMARY_USER = "Прежняя суммаризация:\n{summary}\n\nНовые сообщения ({count}):\n{messages}"
 
+# Факты — блок «ключ — значение», который агент ведёт сам после каждого ответа. В
+# запросе он стоит в инструкции: модели надо объяснить, что это её собственная память,
+# собранная и из сообщений, которых в контексте уже нет.
+FACTS_NOTE = (
+    "\n\nНиже — факты этого разговора ({count} шт.), которые ты сам собрал из всей переписки, "
+    "в том числе из сообщений, которых в контексте уже нет. Это твоя память: опирайся на "
+    "факты как на установленное; если новое сообщение им противоречит, верно новое. Если "
+    "спросят о том, чего нет ни в фактах, ни в сообщениях ниже, честно скажи, что такая "
+    "деталь не сохранилась.\nФакты разговора:\n{facts}"
+)
+
+# Роль для вызова, который обновляет факты. На входе текущий блок и новые сообщения,
+# на выходе — блок целиком: так устаревший факт заменяется, отменённый — исчезает.
+FACTS_SYSTEM = (
+    "Ты ведёшь блок фактов разговора между пользователем и агентом «{name}» — короткую память "
+    "вида «ключ: значение». Тебе дают текущие факты и новые сообщения. Верни обновлённый блок "
+    "целиком.\n"
+    "Что считать фактом: цель и задача пользователя, ограничения и требования, предпочтения, "
+    "принятые решения и договорённости, имена, числа, сроки, названия, что агент уже сделал. "
+    "Не факты: вежливость, рассуждения, пересказ общеизвестного, то, о чём только спросили, "
+    "но ничего не решили.\n"
+    "Правила: ключ — короткое существительное или словосочетание (до четырёх слов), значение — "
+    "одна короткая фраза; если факт изменился — замени значение под тем же ключом, если "
+    "отменён — убери ключ; ничего не выдумывай; не больше {limit} фактов — если их больше, "
+    "оставь самые важные. Пиши на языке разговора.\n"
+    'Верни СТРОГО JSON без пояснений и markdown: {{"facts": {{"ключ": "значение"}}}}'
+)
+
+FACTS_USER = "Текущие факты:\n{facts}\n\nНовые сообщения ({count}):\n{messages}"
+
 PLANNER_SYSTEM = (
     "Ты — планировщик агента. По задаче пользователя реши, нужен ли план действий.\n"
     "Инструменты, доступные исполнителю:\n{tools}\n\n"
@@ -171,6 +217,10 @@ MEMORY_TURNS_MAX = 200
 # двух не бывает — сообщения ходят парами; больше сотни бессмысленно — такая очередь
 # сама по себе весит как хороший запрос.
 SUMMARY_EVERY_MIN, SUMMARY_EVERY_MAX = 2, 100
+
+# Имя ветки или точки ветвления — короткая подпись для вкладки.
+NAME_MAX = 40
+MAIN_BRANCH_NAME = "основная"
 
 # По этим словам в ответе провайдера видно, что запрос отклонён именно по длине.
 # Такую ошибку агент переводит на человеческий язык: «Модель не ответила: 400 …»
@@ -266,6 +316,38 @@ class Summary:
 
 
 @dataclass
+class Facts:
+    """Факты разговора: блок «ключ — значение», который живёт отдельно от сообщений.
+
+    В отличие от суммаризации, факты не заменяют выпавшие из окна сообщения, а
+    собираются из каждого обмена сразу — поэтому важная деталь остаётся в запросе,
+    даже когда сообщение, где она прозвучала, из окна давно ушло. `upto` — до
+    какого сообщения истории факты уже учтены.
+    """
+    items: dict[str, str] = field(default_factory=dict)
+    version: int = 0
+    upto: int = 0
+    at: float | None = None
+
+    def __bool__(self) -> bool:
+        return bool(self.items)
+
+    def text(self) -> str:
+        """Блок в том виде, в каком он уходит модели: строка на факт."""
+        return "\n".join(f"- {key}: {value}" for key, value in self.items.items())
+
+    def to_dict(self) -> dict:
+        return {
+            "items": dict(self.items),
+            "count": len(self.items),
+            "text": self.text(),
+            "version": self.version,
+            "upto": self.upto,
+            "at": self.at,
+        }
+
+
+@dataclass
 class Compression:
     """Что произошло при сжатии: сколько сообщений свёрнуто и во что это обошлось."""
     messages: int            # сколько сообщений ушло в суммаризацию этим разом
@@ -289,11 +371,40 @@ class Compression:
 
 
 @dataclass
+class FactsUpdate:
+    """Что произошло с фактами после ответа: что добавилось, изменилось, ушло."""
+    messages: int            # сколько сообщений обработано этим разом
+    version: int
+    items: int               # сколько фактов в блоке теперь
+    tokens: int              # сколько весит блок в запросе (вместе с заметкой)
+    added: list[str]         # «ключ: значение»
+    changed: list[str]       # «ключ: было → стало»
+    removed: list[str]       # «ключ»
+    text: str                # блок целиком
+    elapsed_s: float
+    call_tokens: int         # во что обошёлся вызов извлечения
+
+    def to_dict(self) -> dict:
+        return {
+            "messages": self.messages,
+            "version": self.version,
+            "items": self.items,
+            "tokens": self.tokens,
+            "added": list(self.added),
+            "changed": list(self.changed),
+            "removed": list(self.removed),
+            "text": self.text,
+            "elapsed_s": self.elapsed_s,
+            "call_tokens": self.call_tokens,
+        }
+
+
+@dataclass
 class Shadow:
-    """Теневой ответ для сравнения: тот же вопрос, но вся история как есть вместо суммаризации.
+    """Теневой ответ для сравнения: тот же вопрос, но вся история как есть вместо стратегии.
 
     Считается и оплачивается по-настоящему, но в память не идёт: он нужен, только
-    чтобы положить рядом два ответа и два счёта — со сжатием и без.
+    чтобы положить рядом два ответа и два счёта — со стратегией и с полной историей.
     """
     text: str
     messages: int             # сколько сообщений истории ушло в модель
@@ -330,8 +441,9 @@ class TokenReport:
     есть когда платить уже поздно. Факт приходит в `usage`, и разница между
     оценкой и фактом здесь же: по ней видно, можно ли счётчику верить.
 
-    Здесь же — цена сжатия: сколько сообщений заменила суммаризация, сколько они
-    весили бы сами и сколько весил бы весь запрос, уйди история как есть.
+    Здесь же — цена стратегии контекста: сколько сообщений истории в модель не
+    ушло дословно, сколько они весили бы, чем их заменили (суммаризация, факты
+    или ничем) и сколько весил бы весь запрос, уйди история как есть.
     """
     breakdown: tokens.Breakdown = field(default_factory=tokens.Breakdown)
     estimated: int = 0            # оценка запроса до отправки
@@ -344,11 +456,19 @@ class TokenReport:
     max_output: int = 0           # потолок генерации у модели
     trimmed_pairs: int = 0        # сколько пар памяти выкинуто, чтобы влезть в окно
     truncated: bool = False       # ответ упёрся в лимит генерации и оборван
+    strategy: str = ""            # стратегия контекста в этом обращении
+    summarize: bool = False       # было ли включено сжатие истории
+    branch: int = MAIN_BRANCH     # в какой ветке шёл разговор
     summary_version: int = 0      # какая суммаризация ушла в запрос (0 — без суммаризации)
     folded_messages: int = 0      # сколько сообщений она заменила
     folded_tokens: int = 0        # сколько они весили бы сами (оценка)
-    pending_messages: int = 0     # выпали из окна, но в суммаризацию ещё не попали
+    facts_version: int = 0        # какой блок фактов ушёл в запрос (0 — без фактов)
+    facts_items: int = 0          # сколько в нём фактов
+    pending_messages: int = 0     # ждут суммаризации
     pending_tokens: int = 0
+    facts_pending: int = 0        # ждут извлечения в блок фактов
+    dropped_messages: int = 0     # сообщений истории, не ушедших в модель дословно и не свёрнутых
+    dropped_tokens: int = 0       # сколько они весили бы в запросе
 
     @property
     def context_used(self) -> int:
@@ -369,18 +489,20 @@ class TokenReport:
 
     @property
     def uncompressed(self) -> int:
-        """Сколько весил бы тот же запрос без сжатия: сообщения как есть вместо суммаризации.
+        """Сколько весил бы тот же запрос с полной историей как есть.
 
-        Считаются и те, что ждут суммаризации: без сжатия они тоже сидели бы в окне.
+        Без блоков стратегии, зато со всеми сообщениями, которые она свернула или
+        отбросила: это и есть «до» для сравнения со стратегией.
         """
-        return self.context_used - self.breakdown.summary + self.folded_tokens + self.pending_tokens
+        return (self.context_used - self.breakdown.summary - self.breakdown.facts
+                + self.folded_tokens + self.dropped_tokens)
 
     @property
     def saved(self) -> int:
-        """Сколько токенов сберегла суммаризация в этом запросе.
+        """Сколько токенов сберегла стратегия в этом запросе.
 
-        Может быть и меньше нуля: пока суммаризация молода, она бывает тяжелее тех
-        нескольких сообщений, которые заменила, — окупается она на длине.
+        Может быть и меньше нуля: пока суммаризация или факты молоды, они бывают
+        тяжелее тех нескольких сообщений, которые заменили, — окупаются на длине.
         """
         return self.uncompressed - self.context_used
 
@@ -397,11 +519,19 @@ class TokenReport:
             "max_output": self.max_output,
             "trimmed_pairs": self.trimmed_pairs,
             "truncated": self.truncated,
+            "strategy": self.strategy,
+            "summarize": self.summarize,
+            "branch": self.branch,
             "summary_version": self.summary_version,
             "folded_messages": self.folded_messages,
             "folded_tokens": self.folded_tokens,
+            "facts_version": self.facts_version,
+            "facts_items": self.facts_items,
             "pending_messages": self.pending_messages,
             "pending_tokens": self.pending_tokens,
+            "facts_pending": self.facts_pending,
+            "dropped_messages": self.dropped_messages,
+            "dropped_tokens": self.dropped_tokens,
             "uncompressed": self.uncompressed,
             "saved": self.saved,
             "context_used": self.context_used,
@@ -428,7 +558,8 @@ class AgentReply:
     sent_messages: int = 0          # сколько сообщений ушло в модель в последнем вызове
     tokens: TokenReport | None = None   # счёт за обращение: оценка, факт и лимиты
     compression: Compression | None = None  # после ответа часть истории свёрнута в суммаризацию
-    shadow: Shadow | None = None    # теневой ответ «без сжатия» для сравнения
+    facts: FactsUpdate | None = None        # после ответа обновлён блок фактов
+    shadow: Shadow | None = None    # теневой ответ «с полной историей» для сравнения
     request: dict | None = None     # «сырой обмен»: тело последнего запроса
     response: dict | None = None    # «сырой обмен»: ответ модели как есть
 
@@ -450,10 +581,16 @@ class AgentReply:
             "sent_messages": self.sent_messages,
             "tokens": self.tokens.to_dict() if self.tokens else None,
             "compression": self.compression.to_dict() if self.compression else None,
+            "facts": self.facts.to_dict() if self.facts else None,
             "shadow": self.shadow.to_dict() if self.shadow else None,
             "request": self.request,
             "response": self.response,
         }
+
+
+def _main_branch() -> dict:
+    """Описание основной ветки: у неё нет строки в хранилище, она есть всегда."""
+    return {"id": MAIN_BRANCH, "name": MAIN_BRANCH_NAME, "origin": "", "shared": 0, "fork_at": 0}
 
 
 @dataclass
@@ -466,7 +603,8 @@ class Agent:
 
     Если агенту дали хранилище (`store`), он сам записывает туда каждое обращение
     и каждую смену настроек — и переживает перезапуск приложения. Без хранилища
-    агент полностью работоспособен, просто помнит разговор только до закрытия.
+    агент полностью работоспособен, просто помнит разговор только до закрытия;
+    без хранилища нет только веток и точек ветвления — они живут в истории.
     """
     profile: AgentProfile = DEFAULT_PROFILE
     model: str = config.DEFAULT_MODEL
@@ -476,17 +614,24 @@ class Agent:
     tools_enabled: bool = config.AGENT_TOOLS      # давать ли модели инструменты
     planning: bool = config.AGENT_PLANNING        # писать ли план перед работой
     max_steps: int = config.AGENT_MAX_STEPS       # потолок шагов цикла за обращение
-    compression: bool = config.AGENT_COMPRESSION  # сворачивать ли выпавшее из окна в суммаризацию
+    strategy: str = config.AGENT_STRATEGY         # стратегия контекста: window / facts / branches
+    summarize: bool = config.AGENT_SUMMARIZE      # сжимать ли историю — опция поверх любой стратегии
     summary_every: int = config.AGENT_SUMMARY_EVERY  # сколько сообщений копить до обновления суммаризации
 
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     created_at: float = field(default_factory=time.time)
     turns: int = 0                                # сколько запросов агент обработал
+    branch: int = MAIN_BRANCH                     # активная ветка диалога
     store: Store | None = field(default=None, repr=False)   # куда класть состояние
     restored: bool = False                        # поднят из истории, а не создан заново
     _memory: list[dict] = field(default_factory=list, repr=False)    # окно контекста: как есть
-    _pending: list[dict] = field(default_factory=list, repr=False)   # выпали из окна, ждут суммаризации
+    # Две очереди, потому что сжатие и факты работают независимо и могут быть включены
+    # одновременно: в первую попадает выпавшее из окна, во вторую — каждый новый обмен.
+    _pending_summary: list[dict] = field(default_factory=list, repr=False)  # ждут суммаризации
+    _pending_facts: list[dict] = field(default_factory=list, repr=False)    # ждут извлечения фактов
     _summary: Summary = field(default_factory=Summary, repr=False)   # свёрнутое начало разговора
+    _facts: Facts = field(default_factory=Facts, repr=False)         # блок фактов «ключ — значение»
+    _branch: dict = field(default_factory=_main_branch, repr=False)  # описание активной ветки
 
     # ------------------------------------------------------------------- вход --
 
@@ -494,9 +639,8 @@ class Agent:
         """Единственный публичный вход: принять запрос и вернуть ответ агента.
 
         `compare=True` — заодно получить теневой ответ на тот же вопрос, но с
-        полной историей вместо суммаризации: два ответа и два счёта рядом, чтобы
-        сравнить сжатие с его отсутствием. Настоящий ответ при этом один — тот,
-        что идёт в память.
+        полной историей вместо стратегии контекста: два ответа и два счёта рядом.
+        Настоящий ответ при этом один — тот, что идёт в память.
         """
         text = self._prepare(message)                       # 1. проверка входа
         started = time.perf_counter()
@@ -504,36 +648,48 @@ class Agent:
         steps: list[AgentStep] = []
 
         logger.info(
-            "Агент «%s» [%s] ← запрос #%d (%d симв.) · инструменты=%s · план=%s · сжатие=%s",
+            "Агент «%s» [%s] ← запрос #%d (%d симв.) · инструменты=%s · план=%s · стратегия=%s · "
+            "сжатие=%s · ветка=%s",
             self.profile.name, self.id, self.turns + 1, len(text), self.tools_enabled, self.planning,
-            self.compression,
+            self.strategy, self.summarize, self._branch["name"],
         )
 
         plan = self._make_plan(text, totals)                # 2. план действий
         specs = tools.specs() if self.tools_enabled else None
         prompt = self._system_prompt(plan)
-        block = self._summary_block()                       #    суммаризация внутри инструкции
+        summary_block = self._summary_block()               #    блоки стратегии внутри инструкции
+        facts_block = self._facts_block()
         window, dropped = self._fit_context(prompt, text, specs)   # 3. бюджет контекста
+        beyond, beyond_tokens = self._beyond_window()
         report = TokenReport(
-            breakdown=tokens.measure(prompt, window, text, specs, self.model, summary=block),
+            breakdown=tokens.measure(prompt, window, text, specs, self.model,
+                                     summary=summary_block, facts=facts_block),
             limit=self._context_limit(),
             reserve=self._answer_reserve(),
             max_output=config.model_max_output(self.model),
             trimmed_pairs=dropped,
-            summary_version=self._summary.version if block else 0,
-            folded_messages=self._summary.messages if block else 0,
-            folded_tokens=self._summary.tokens if block else 0,
-            pending_messages=len(self._pending),
-            pending_tokens=tokens.measure_messages(self._pending, self.model),
+            strategy=self.strategy,
+            summarize=self.summarize,
+            branch=self.branch,
+            summary_version=self._summary.version if summary_block else 0,
+            folded_messages=self._summary.messages if summary_block else 0,
+            folded_tokens=self._summary.tokens if summary_block else 0,
+            facts_version=self._facts.version if facts_block else 0,
+            facts_items=len(self._facts.items) if facts_block else 0,
+            pending_messages=len(self._pending_summary),
+            pending_tokens=tokens.measure_messages(self._pending_summary, self.model),
+            facts_pending=len(self._pending_facts),
+            dropped_messages=beyond,
+            dropped_tokens=beyond_tokens,
         )
         report.estimated = report.breakdown.total
         messages = self._build_messages(prompt, window, text)      #    сборка запроса
         logger.info(
-            "Агент «%s» [%s]: в запрос уйдёт ≈%d токенов (инструкция %d + суммаризация %d + память %d "
-            "+ вопрос %d + схемы %d) из окна %d · суммаризация заменяет %d сообщ. ≈ %d токенов",
+            "Агент «%s» [%s]: в запрос уйдёт ≈%d токенов (инструкция %d + суммаризация %d + факты %d "
+            "+ память %d + вопрос %d + схемы %d) из окна %d · за окном %d сообщ. ≈ %d токенов",
             self.profile.name, self.id, report.estimated, report.breakdown.system,
-            report.breakdown.summary, report.breakdown.memory, report.breakdown.question,
-            report.breakdown.tools, report.limit, report.folded_messages, report.folded_tokens,
+            report.breakdown.summary, report.breakdown.facts, report.breakdown.memory,
+            report.breakdown.question, report.breakdown.tools, report.limit, beyond, beyond_tokens,
         )
 
         raw, first_usage = None, None
@@ -556,18 +712,21 @@ class Agent:
         answer = self._postprocess(raw["content"], steps)   # 5. разбор ответа
         shadow = self._shadow(plan, text, specs, totals) if compare else None
         self.turns += 1
-        pair = self._remember(text, answer)                 # 6. память: окно и очередь на суммаризацию
-        folded = self._compress(totals)                     #    очередь набралась — обновить суммаризацию
+        pair = self._remember(text, answer)                 # 6. память: окно и очереди
+        sticky = self._update_facts(totals)                 #    факты: обновить блок по новому обмену
+        folded = self._compress(totals)                     #    сжатие: очередь набралась — свернуть
         self._close_report(report, totals, raw, first_usage)
-        self._save(pair, report, totals, shadow)            #    история, состояние, расход — одной записью
+        self._save(pair, report, totals, shadow, sticky)    #    история, состояние, расход — одной записью
 
         elapsed = time.perf_counter() - started
         logger.info(
             "Агент «%s» [%s] → ответ #%d за %.2f c · шагов=%d · вызовов модели=%d · в памяти %d сообщ., "
-            "ждут суммаризации %d · токены: оценка %d → факт %d (%s%%), ответ %d, всего за обращение %d",
+            "ждут суммаризации %d, ждут фактов %d · токены: оценка %d → факт %d (%s%%), ответ %d, "
+            "всего за обращение %d",
             self.profile.name, self.id, self.turns, elapsed, len(steps), totals.llm_calls,
-            len(self._memory), len(self._pending), report.estimated, report.prompt_tokens,
-            report.error_pct, report.completion_tokens, report.total_prompt + report.total_completion,
+            len(self._memory), len(self._pending_summary), len(self._pending_facts), report.estimated,
+            report.prompt_tokens, report.error_pct, report.completion_tokens,
+            report.total_prompt + report.total_completion,
         )
 
         return AgentReply(
@@ -586,6 +745,7 @@ class Agent:
             sent_messages=len(messages),
             tokens=report,
             compression=folded,
+            facts=sticky,
             shadow=shadow,
             request=raw["request"],
             response=raw["response"],
@@ -741,21 +901,22 @@ class Agent:
         self,
         plan: list[str],
         memory: list[dict] | None = None,
-        summary: bool = True,
+        blocks: bool = True,
     ) -> str:
-        """Роль агента, дополненная правилами про инструменты, суммаризацию, память и план.
+        """Роль агента, дополненная правилами про инструменты, память стратегии и план.
 
         Роль пишет пользователь, и полагаться на неё в этих вопросах нельзя: про
-        инструменты, суммаризацию и собственную память агент рассказывает модели сам.
-        `memory` — окно, которое пойдёт следом (по умолчанию своё), `summary=False`
-        собирает инструкцию без суммаризации — так строится теневой запрос «без сжатия».
+        инструменты, суммаризацию, факты и собственную память агент рассказывает
+        модели сам. `memory` — окно, которое пойдёт следом (по умолчанию своё),
+        `blocks=False` собирает инструкцию без блоков стратегии — так строится
+        теневой запрос «с полной историей».
         """
         window = self._memory if memory is None else memory
         prompt = self.profile.instructions
         if self.tools_enabled:
             prompt += TOOLS_NOTE
             prompt += f"\n\nРабочая папка для файловых инструментов: {tools.workspace()}"
-        block = self._summary_block() if summary else ""
+        block = (self._summary_block() + self._facts_block()) if blocks else ""
         prompt += block
         if window:
             prompt += MEMORY_NOTE.format(count=len(window), when=self._last_seen())
@@ -773,12 +934,18 @@ class Agent:
         """Суммаризация в том виде, в каком она уходит в инструкцию.
 
         Пусто, если сворачивать пока нечего или сжатие выключено: выключенное сжатие
-        не стирает суммаризацию, а лишь перестаёт её подставлять — включат обратно, и
-        она снова в деле.
+        не стирает суммаризацию, а лишь перестаёт её подставлять — включат обратно,
+        и она снова в деле.
         """
-        if not self.compression or not self._summary:
+        if not self.summarize or not self._summary:
             return ""
         return SUMMARY_NOTE.format(count=self._summary.messages, summary=self._summary.text)
+
+    def _facts_block(self) -> str:
+        """Факты в том виде, в каком они уходят в инструкцию (пусто вне стратегии facts)."""
+        if self.strategy != "facts" or not self._facts:
+            return ""
+        return FACTS_NOTE.format(count=len(self._facts.items), facts=self._facts.text())
 
     def _call(
         self,
@@ -790,7 +957,7 @@ class Agent:
         """Один вызов модели через транспорт; сбой превращаем в ошибку агента.
 
         Температура и лимит ответа по умолчанию — настройки агента; служебные
-        вызовы (суммаризация) передают свои.
+        вызовы (суммаризация, факты) передают свои.
         """
         try:
             return llm.chat(
@@ -875,14 +1042,17 @@ class Agent:
 
         В памяти держим только вопрос и итоговый ответ: служебная переписка с
         инструментами нужна внутри одного обращения, а в долгой памяти она бы
-        быстро съела контекст и деньги. Что при этом выпало из окна, уходит в
-        очередь на суммаризацию (см. `_trim_memory`).
+        быстро съела контекст и деньги. Со стратегией фактов пара сразу встаёт в
+        очередь на извлечение; что при этом выпало из окна, уходит в очередь на
+        суммаризацию (см. `_trim_memory`) — если сжатие включено.
         """
         pair = [
             {"role": "user", "content": question},
             {"role": "assistant", "content": answer},
         ]
         self._memory.extend(pair)
+        if self.strategy == "facts":
+            self._pending_facts.extend(pair)  # факты извлекаются из каждого обмена, а не из выпавшего
         self._trim_memory()
         return pair
 
@@ -892,19 +1062,33 @@ class Agent:
         report: TokenReport,
         totals: _Totals,
         shadow: Shadow | None = None,
+        sticky: FactsUpdate | None = None,
     ) -> None:
-        """Записать обращение в хранилище: пара сообщений, состояние агента и расход.
+        """Записать обращение в хранилище: пара сообщений, состояние агента, расход и факты.
 
         Одной записью, чтобы история, счётчик обращений и токены не разъезжались.
         Строка расхода и превращает «сколько стоило» в наблюдаемую величину: по
         ней видно, как цена растёт от обращения к обращению — и как перестаёт
-        расти, когда в дело вступает суммаризация.
+        расти, когда в дело вступает стратегия. Обновлённый блок фактов пишется
+        той же транзакцией: его граница — последнее сообщение этой пары.
         """
         if self.store is None:
             return
-        ids = self.store.save_turn(self.state(), pair, self._usage_row(report, totals, shadow))
+        facts_row = None
+        if sticky is not None:
+            facts_row = {
+                "version": self._facts.version,
+                "turn": self.turns,
+                "upto": self._facts.upto,
+                "items": len(self._facts.items),
+                "facts_tokens": sticky.tokens,
+                "content": json.dumps(self._facts.items, ensure_ascii=False),
+            }
+        ids = self.store.save_turn(self.state(), pair, self._usage_row(report, totals, shadow), facts=facts_row)
         for message, number in zip(pair, ids):
             message["id"] = number   # окно помнит, какой строке истории отвечает сообщение
+        if sticky is not None and ids:
+            self._facts.upto = ids[-1]
 
     def _usage_row(self, report: TokenReport, totals: _Totals, shadow: Shadow | None = None) -> dict:
         """Расход обращения одной строкой — то, из чего потом рисуется рост цены."""
@@ -925,20 +1109,27 @@ class Agent:
             "folded_messages": report.folded_messages,
             "folded_tokens": report.folded_tokens,
             "shadow_tokens": shadow.prompt_tokens + shadow.completion_tokens if shadow else 0,
+            "strategy": self.strategy,
+            "summarize": int(self.summarize),
+            "branch": self.branch,
+            "facts_tokens": report.breakdown.facts,
+            "dropped_messages": report.dropped_messages,
+            "dropped_tokens": report.dropped_tokens,
         }
 
     def _trim_memory(self) -> None:
-        """Оставить в окне последние `memory_turns` пар; выпавшее — в очередь на суммаризацию.
+        """Оставить в окне последние `memory_turns` пар; выпавшее — по правилам сжатия.
 
         Без сжатия выпавшие сообщения просто перестают уходить в модель (в истории
-        они остаются). Со сжатием они ждут, пока их наберётся на суммаризацию.
+        они остаются; фактам они и не нужны — блок уже собран из них). Со сжатием
+        они встают в очередь и ждут, пока наберётся на обновление суммаризации.
         """
         extra = len(self._memory) - max(0, self.memory_turns) * 2
         if extra > 0:
             overflow = self._memory[:extra]
             del self._memory[:extra]
-            if self.compression:
-                self._pending.extend(overflow)
+            if self.summarize:
+                self._pending_summary.extend(overflow)
 
     def _compress(self, totals: _Totals) -> Compression | None:
         """Свернуть очередь в суммаризацию, если она набралась.
@@ -949,15 +1140,18 @@ class Agent:
         температура, строгий формат. Прежняя суммаризация подаётся на вход, поэтому
         новая — суммаризация всего разговора, а не только последних сообщений.
 
+        Сжатие — опция, а не стратегия: оно включается поверх любой из них, поэтому
+        сюда агент заходит и со скользящим окном, и с фактами, и в ветке.
+
         Сбой здесь не роняет обращение: ответ пользователь уже получил, а очередь
         подождёт следующего раза.
         """
-        if not self.compression:
+        if not self.summarize:
             return None
         # С хранилищем сворачиваем только то, что уже записано в историю (у таких
         # сообщений есть номер строки): по нему после перезапуска видно, что уже в
         # суммаризации, а что ещё нет. Без хранилища сворачиваем всё, что накопилось.
-        batch = [m for m in self._pending if self.store is None or m.get("id")]
+        batch = [m for m in self._pending_summary if self.store is None or m.get("id")]
         if len(batch) < max(1, self.summary_every):
             return None
 
@@ -996,7 +1190,7 @@ class Agent:
             at=time.time(),
         )
         taken = {id(m) for m in batch}
-        self._pending = [m for m in self._pending if id(m) not in taken]
+        self._pending_summary = [m for m in self._pending_summary if id(m) not in taken]
         if self.store is not None:
             self.store.save_summary(self.id, {
                 "version": self._summary.version,
@@ -1006,7 +1200,7 @@ class Agent:
                 "folded_tokens": self._summary.tokens,
                 "summary_tokens": after,
                 "content": text,
-            })
+            }, self.branch)
         usage = raw.get("usage") or {}
         logger.info(
             "Агент «%s» [%s]: %d сообщ. ≈ %d токенов свёрнуты в суммаризацию №%d ≈ %d токенов "
@@ -1024,6 +1218,76 @@ class Agent:
             call_tokens=usage.get("total_tokens", 0),
         )
 
+    def _update_facts(self, totals: _Totals) -> FactsUpdate | None:
+        """Обновить блок фактов по новым сообщениям (стратегия facts).
+
+        Каждый обмен «вопрос-ответ» уходит отдельным вызовом модели вместе с
+        текущим блоком; обратно приходит блок целиком — так изменившийся факт
+        заменяется, отменённый исчезает, а важная деталь остаётся в запросе, даже
+        когда сообщение с ней давно выпало из окна. Очередь обрабатывается с
+        начала порциями по `FACTS_BATCH`: включили стратегию на длинном разговоре —
+        факты догоняют историю за несколько обращений.
+
+        Сбой не роняет обращение: ответ уже получен, очередь подождёт следующего.
+        """
+        if self.strategy != "facts" or not self._pending_facts:
+            return None
+        batch = self._pending_facts[:config.FACTS_BATCH]
+        listing = "\n".join(
+            f"[{'пользователь' if m['role'] == 'user' else 'агент'}] {m['content']}" for m in batch
+        )
+        started = time.perf_counter()
+        try:
+            raw = totals.add(self._call(
+                [{"role": "system", "content": FACTS_SYSTEM.format(
+                    name=self.profile.name, limit=config.FACTS_LIMIT)},
+                 {"role": "user", "content": FACTS_USER.format(
+                     facts=json.dumps({"facts": self._facts.items}, ensure_ascii=False)
+                     if self._facts else "(пока пусто)",
+                     count=len(batch), messages=listing)}],
+                None,
+                temperature=config.FACTS_TEMPERATURE,
+                max_tokens=config.FACTS_MAX_TOKENS,
+            ))
+        except AgentError as e:
+            logger.warning("Агент «%s» [%s]: факты не обновлены (%s) — очередь подождёт",
+                           self.profile.name, self.id, e)
+            return None
+        items = _parse_facts(raw["content"])
+        if items is None or (not items and self._facts):
+            # Не разобрать или пустой блок при непустых фактах: скорее сбой формата,
+            # чем «все факты отменены». Прежний блок остаётся.
+            logger.warning("Агент «%s» [%s]: блок фактов не разобрать — оставляем прежний",
+                           self.profile.name, self.id)
+            return None
+
+        before = dict(self._facts.items)
+        added = [f"{key}: {value}" for key, value in items.items() if key not in before]
+        changed = [f"{key}: {before[key]} → {value}" for key, value in items.items()
+                   if key in before and before[key] != value]
+        removed = [key for key in before if key not in items]
+        self._facts = Facts(items=items, version=self._facts.version + 1, upto=self._facts.upto, at=time.time())
+        del self._pending_facts[:len(batch)]
+        weight = tokens.measure_text(self._facts_block(), self.model)
+        usage = raw.get("usage") or {}
+        logger.info(
+            "Агент «%s» [%s]: факты №%d — %d шт. ≈ %d токенов (+%d, ~%d, −%d) по %d сообщ.",
+            self.profile.name, self.id, self._facts.version, len(items), weight,
+            len(added), len(changed), len(removed), len(batch),
+        )
+        return FactsUpdate(
+            messages=len(batch),
+            version=self._facts.version,
+            items=len(items),
+            tokens=weight,
+            added=added,
+            changed=changed,
+            removed=removed,
+            text=self._facts.text(),
+            elapsed_s=round(time.perf_counter() - started, 3),
+            call_tokens=usage.get("total_tokens", 0),
+        )
+
     def _shadow(
         self,
         plan: list[str],
@@ -1033,13 +1297,13 @@ class Agent:
     ) -> Shadow:
         """Теневой ответ для сравнения: тот же вопрос, но вся история как есть.
 
-        Суммаризация в запрос не идёт, вместо неё — все сообщения истории, сколько
-        влезает в окно модели. Ответ не запоминается и на разговор не влияет: это
-        измерение, а не обращение. Стоит он по-настоящему, поэтому считается в
-        расход обращения вместе с остальными вызовами.
+        Блоки стратегии в запрос не идут, вместо них — все сообщения истории
+        активной ветки, сколько влезает в окно модели. Ответ не запоминается и на
+        разговор не влияет: это измерение, а не обращение. Стоит он по-настоящему,
+        поэтому считается в расход обращения вместе с остальными вызовами.
         """
         history = self._full_history()
-        prompt = self._system_prompt(plan, memory=history, summary=False)
+        prompt = self._system_prompt(plan, memory=history, blocks=False)
         room = self._context_limit() - self._answer_reserve()
         fixed = tokens.measure(prompt, [], text, specs, self.model).total
         window, dropped = list(history), 0
@@ -1058,7 +1322,7 @@ class Agent:
                 "): теневой прогон их не исполняет, сравнивать здесь можно только контекст."
             )
         logger.info(
-            "Агент «%s» [%s]: теневой ответ без сжатия — %d сообщ. истории, %d→%d токенов",
+            "Агент «%s» [%s]: теневой ответ с полной историей — %d сообщ., %d→%d токенов",
             self.profile.name, self.id, len(window), usage.get("prompt_tokens", 0),
             usage.get("completion_tokens", 0),
         )
@@ -1076,37 +1340,63 @@ class Agent:
         )
 
     def _full_history(self) -> list[dict]:
-        """Вся переписка как есть — то, что ушло бы в модель без сжатия."""
+        """Вся переписка активной ветки как есть — то, что ушло бы в модель без стратегии."""
         if self.store is not None:
-            return [_slim(m) for m in self.store.messages(self.id)]
+            return [_slim(m) for m in self.store.messages(self.id, self.branch)]
         # Без хранилища свёрнутое уже не вернуть: есть только очередь и окно.
-        return [_slim(m) for m in self._pending + self._memory]
+        return [_slim(m) for m in self._pending_summary + self._memory]
 
-    def _load_memory(self) -> None:
-        """Собрать окно контекста и очередь на суммаризацию из истории.
+    def _beyond_window(self, history: list[dict] | None = None) -> tuple[int, int]:
+        """Сколько сообщений истории в модель дословно не уходит — и сколько они весили бы.
 
-        Вызывается при восстановлении агента и при смене глубины памяти или режима
-        сжатия: увеличили глубину — агент дотягивает из истории то, что уже забыл,
-        включили сжатие — всё, что за окном и ещё не в суммаризации, встаёт в очередь.
-        Что уже свёрнуто, в окно не возвращается: платить за это дважды незачем.
+        Это то, с чем работают стратегия и сжатие: скользящее окно эти сообщения
+        отбрасывает, факты заменяют своим блоком, сжатие ставит их в очередь на
+        суммаризацию. Уже свёрнутое не считается — оно в запросе представлено
+        суммаризацией.
         """
         if self.store is None:
+            rest = self._pending_summary if self.summarize else []
+        else:
+            history = self._full_history() if history is None else history
+            in_window = {m["id"] for m in self._memory if m.get("id")}
+            upto = self._summary.upto if self._summary_block() else 0
+            rest = [m for m in history if (m.get("id") or 0) > upto and m.get("id") not in in_window]
+        return len(rest), tokens.measure_messages(rest, self.model)
+
+    def _load_memory(self) -> None:
+        """Собрать окно контекста и обе очереди из истории активной ветки.
+
+        Вызывается при восстановлении агента, при смене глубины памяти, стратегии,
+        сжатия или ветки: увеличили глубину — агент дотягивает из истории то, что
+        уже забыл; включили сжатие — всё, что за окном и ещё не в суммаризации,
+        встаёт в очередь на неё; включили факты — в очередь встаёт всё, что в блоке
+        фактов ещё не учтено. Свёрнутое в суммаризацию в окно не возвращается:
+        платить за это дважды незачем.
+        """
+        if self.store is None:
+            if not self.summarize:
+                self._pending_summary.clear()
+            if self.strategy != "facts":
+                self._pending_facts.clear()
             self._trim_memory()
             return
-        history = [_slim(m) for m in self.store.messages(self.id)]
-        if self.compression:
+        history = [_slim(m) for m in self.store.messages(self.id, self.branch)]
+        if self.summarize:
             history = [m for m in history if m["id"] > self._summary.upto]
         keep = max(0, self.memory_turns) * 2
         window = history[-keep:] if keep else []
         rest = history[:len(history) - len(window)]
         self._memory = window
-        self._pending = rest if self.compression else []
+        self._pending_summary = rest if self.summarize else []
+        self._pending_facts = (
+            [m for m in history if m["id"] > self._facts.upto] if self.strategy == "facts" else []
+        )
 
     def _load_summary(self) -> None:
-        """Поднять действующую суммаризацию из хранилища (последнюю версию)."""
+        """Поднять действующую суммаризацию ветки из хранилища (последнюю версию)."""
         if self.store is None:
             return
-        row = self.store.summary(self.id)
+        row = self.store.summary(self.id, self.branch)
         self._summary = Summary(
             text=row["content"],
             version=row["version"],
@@ -1116,9 +1406,43 @@ class Agent:
             at=row["at"],
         ) if row else Summary()
 
+    def _load_facts(self) -> None:
+        """Поднять действующий блок фактов ветки из хранилища (последнюю версию)."""
+        if self.store is None:
+            return
+        row = self.store.facts(self.id, self.branch)
+        if not row:
+            self._facts = Facts()
+            return
+        try:
+            items = json.loads(row["content"] or "{}")
+        except json.JSONDecodeError:
+            items = {}
+        self._facts = Facts(
+            items={str(k): str(v) for k, v in items.items()} if isinstance(items, dict) else {},
+            version=row["version"],
+            upto=row["upto"],
+            at=row["at"],
+        )
+
+    def _load_branch(self) -> None:
+        """Найти описание активной ветки; нет такой — вернуться в основную."""
+        if self.branch == MAIN_BRANCH or self.store is None:
+            self.branch = MAIN_BRANCH
+            self._branch = _main_branch()
+            return
+        row = next((b for b in self.store.branches(self.id) if b["id"] == self.branch), None)
+        if row is None:
+            logger.warning("Агент [%s]: ветки %d больше нет — открываем основную", self.id, self.branch)
+            self.branch = MAIN_BRANCH
+            self._branch = _main_branch()
+            return
+        self._branch = {"id": row["id"], "name": row["name"], "origin": row["origin"],
+                        "shared": row["shared"], "fork_at": row["fork_at"]}
+
     def _last_seen(self) -> str:
         """Когда в памяти появилось последнее сообщение — для заметки модели."""
-        moment = self.store.last_at(self.id) if self.store is not None else None
+        moment = self.store.last_at(self.id, self.branch) if self.store is not None else None
         return time.strftime("%d.%m.%Y %H:%M", time.localtime(moment)) if moment else "недавно"
 
     # ------------------------------------------------------------ управление им --
@@ -1132,7 +1456,8 @@ class Agent:
         planning: bool | None = None,
         max_steps: int | None = None,
         max_tokens: int | None = None,
-        compression: bool | None = None,
+        strategy: str | None = None,
+        summarize: bool | None = None,
         summary_every: int | None = None,
     ) -> None:
         """Изменить настройки агента.
@@ -1140,9 +1465,20 @@ class Agent:
         Проверки живут здесь, а не в интерфейсе: настройки — часть самого агента,
         и любой интерфейс поверх него получает их бесплатно.
         """
-        if compression is not None:
-            self.compression = bool(compression)
-            self._load_memory()  # режим сменился: очередь на суммаризацию собирается заново
+        if strategy is not None:
+            if strategy not in config.STRATEGY_BY_CODE:
+                raise AgentError(
+                    f"Стратегия «{strategy}» неизвестна. Доступны: "
+                    + ", ".join(s["code"] for s in config.STRATEGIES) + "."
+                )
+            self.strategy = strategy
+            self._load_memory()  # стратегия сменилась: очереди собираются заново под её правила
+        if summarize is not None:
+            self.summarize = bool(summarize)
+            # Включили сжатие на живом агенте — всё, что за окном и ещё не свёрнуто,
+            # встаёт в очередь и свернётся после следующего ответа; выключили —
+            # очередь расходится, а сама суммаризация остаётся в базе.
+            self._load_memory()
         if summary_every is not None:
             if not SUMMARY_EVERY_MIN <= summary_every <= SUMMARY_EVERY_MAX:
                 raise AgentError(
@@ -1191,10 +1527,10 @@ class Agent:
             self.max_tokens = int(max_tokens) or None   # ноль означает «без ограничения»
         logger.info(
             "Агент «%s» [%s]: настройки — модель=%s, t°=%s, память=%d пар, инструменты=%s, "
-            "план=%s, шагов=%d, лимит ответа=%s, сжатие=%s (каждые %d сообщ.)",
+            "план=%s, шагов=%d, лимит ответа=%s, стратегия=%s, сжатие=%s (суммаризация каждые %d сообщ.)",
             self.profile.name, self.id, self.model, self.temperature, self.memory_turns,
             self.tools_enabled, self.planning, self.max_steps, self.max_tokens or "без ограничения",
-            self.compression, self.summary_every,
+            self.strategy, "вкл" if self.summarize else "выкл", self.summary_every,
         )
         self.persist()  # настройки тоже переживают перезапуск
 
@@ -1221,19 +1557,112 @@ class Agent:
         logger.info("Агент [%s]: паспорт обновлён — «%s», %s", self.id, self.profile.name, self.profile.role)
 
     def reset(self) -> None:
-        """Забыть диалог — и в памяти, и в истории на диске.
+        """Забыть диалог — и в памяти, и в истории на диске, во всех ветках.
 
         Паспорт и настройки остаются: агент тот же самый, просто без прошлого.
         Стирать историю здесь важно, иначе после перезапуска забытое вернулось бы.
         """
         self._memory.clear()
-        self._pending.clear()
+        self._pending_summary.clear()
+        self._pending_facts.clear()
         self._summary = Summary()
+        self._facts = Facts()
         self.turns = 0
+        self.branch = MAIN_BRANCH
+        self._branch = _main_branch()
         if self.store is not None:
             self.store.forget(self.id)
         self.persist()
         logger.info("Агент «%s» [%s]: память и история очищены", self.profile.name, self.id)
+
+    # ------------------------------------------------------------ ветки диалога --
+
+    def checkpoint(self, name: str = "") -> dict:
+        """Поставить точку ветвления после последнего сообщения активной ветки.
+
+        Точка — место в истории, от которого создаются ветки. Обычно её ставит сам
+        `fork()` в момент ветвления, и тогда она остаётся в истории как адрес: от неё
+        можно отвести ещё одну ветку, когда разговор уже ушёл дальше. Разговор точка
+        не меняет — только запоминает границу.
+        """
+        self._need_store("точек ветвления")
+        upto = self.store.last_id(self.id, self.branch)
+        if not upto:
+            raise AgentError("Точка ветвления ставится в разговоре: в этой ветке пока нет сообщений.")
+        count = self.store.count(self.id, self.branch)
+        name = _clean_name(name) or f"Точка {len(self.checkpoints()) + 1}"
+        number = self.store.add_checkpoint(self.id, self.branch, upto, count, name)
+        logger.info("Агент «%s» [%s]: точка ветвления «%s» после %d сообщ. ветки «%s»",
+                    self.profile.name, self.id, name, count, self._branch["name"])
+        return {"id": number, "branch": self.branch, "upto": upto, "messages": count, "name": name}
+
+    def fork(self, name: str = "", checkpoint: int | None = None) -> dict:
+        """Создать ветку от точки ветвления и переключиться на неё.
+
+        Без точки ветка отходит от текущего места: точка ставится тут же. Ветка
+        получает копию общего начала разговора (сообщения до точки, а с ними
+        суммаризацию и факты на тот момент) и дальше живёт независимо: её
+        сообщения, суммаризации и факты в другие ветки не попадают.
+        """
+        self._need_store("веток")
+        if checkpoint is None:
+            point = self.checkpoint()
+        else:
+            point = next((c for c in self.checkpoints() if c["id"] == checkpoint), None)
+            if point is None:
+                raise AgentError("Такой точки ветвления нет — возможно, её ветка удалена.")
+        name = _clean_name(name) or f"Ветка {len(self.store.branches(self.id)) + 1}"
+        branch = self.store.fork(
+            self.id, point["branch"], point["upto"], name, origin=point["name"], checkpoint=point["id"]
+        )
+        self.switch_branch(branch)
+        logger.info("Агент «%s» [%s]: ветка «%s» [%d] от точки «%s» (%d общих сообщ.)",
+                    self.profile.name, self.id, name, branch, point["name"], point["messages"])
+        return {"id": branch, "name": name, "origin": point["name"], "shared": point["messages"]}
+
+    def switch_branch(self, branch: int) -> None:
+        """Переключиться на ветку: память, суммаризация и факты собираются из её истории."""
+        self._need_store("веток")
+        if not self.store.branch_exists(self.id, int(branch)):
+            raise AgentError("Такой ветки нет.")
+        self.branch = int(branch)
+        self._load_branch()
+        self._load_summary()
+        self._load_facts()
+        self._load_memory()
+        self.persist()   # следующий запуск откроет ту же ветку
+        logger.info("Агент «%s» [%s]: активна ветка «%s» — %d сообщ. в памяти из %d",
+                    self.profile.name, self.id, self._branch["name"], len(self._memory), self.history_size)
+
+    def delete_branch(self, branch: int) -> None:
+        """Удалить ветку вместе с её перепиской; основную удалить нельзя."""
+        self._need_store("веток")
+        if int(branch) == MAIN_BRANCH:
+            raise AgentError("Основную ветку удалить нельзя — это сама история агента.")
+        if int(branch) == self.branch:
+            self.switch_branch(MAIN_BRANCH)
+        self.store.remove_branch(self.id, int(branch))
+
+    def branches(self) -> list[dict]:
+        """Все ветки агента, начиная с основной; у активной `active` = True."""
+        main = _main_branch()
+        main["checkpoint"] = 0
+        main["at"] = self.created_at
+        main["messages"] = self.history_size if self.branch == MAIN_BRANCH else (
+            self.store.count(self.id, MAIN_BRANCH) if self.store is not None else 0
+        )
+        rows = [main] + (self.store.branches(self.id) if self.store is not None else [])
+        for row in rows:
+            row["active"] = row["id"] == self.branch
+        return rows
+
+    def checkpoints(self) -> list[dict]:
+        """Точки ветвления агента во всех ветках."""
+        return self.store.checkpoints(self.id) if self.store is not None else []
+
+    def _need_store(self, what: str) -> None:
+        if self.store is None:
+            raise AgentError(f"Без хранилища нет {what}: ветки живут в истории на диске.")
 
     # ------------------------------------------------- состояние между запусками --
 
@@ -1246,6 +1675,7 @@ class Agent:
             "id": self.id,
             "created_at": self.created_at,
             "turns": self.turns,
+            "branch": self.branch,
             "profile": {
                 "name": self.profile.name,
                 "role": self.profile.role,
@@ -1259,7 +1689,8 @@ class Agent:
                 "tools_enabled": self.tools_enabled,
                 "planning": self.planning,
                 "max_steps": self.max_steps,
-                "compression": self.compression,
+                "strategy": self.strategy,
+                "summarize": self.summarize,
                 "summary_every": self.summary_every,
             },
         }
@@ -1278,6 +1709,7 @@ class Agent:
         if not config.is_allowed_model(model):
             logger.warning("В истории модель «%s» вне реестра — берём %s", model, config.DEFAULT_MODEL)
             model = config.DEFAULT_MODEL
+        strategy, summarize = _strategy_and_summarize(settings)
 
         agent = cls(
             profile=AgentProfile(
@@ -1292,21 +1724,28 @@ class Agent:
             tools_enabled=bool(settings.get("tools_enabled", config.AGENT_TOOLS)),
             planning=bool(settings.get("planning", config.AGENT_PLANNING)),
             max_steps=int(settings.get("max_steps", config.AGENT_MAX_STEPS)),
-            compression=bool(settings.get("compression", config.AGENT_COMPRESSION)),
+            strategy=strategy,
+            summarize=summarize,
             summary_every=int(settings.get("summary_every") or config.AGENT_SUMMARY_EVERY),
             id=state.get("id") or uuid.uuid4().hex[:8],
             created_at=float(state.get("created_at") or time.time()),
             turns=int(state.get("turns") or 0),
+            branch=int(state.get("branch") or MAIN_BRANCH),
             store=store,
             restored=True,
         )
-        agent._load_summary()   # сначала суммаризация: от её границы зависит, что войдёт в окно
+        agent._load_branch()    # сначала ветка: остальное читается из её истории
+        agent._load_summary()   # суммаризация раньше окна: от её границы зависит, что войдёт в окно
+        agent._load_facts()
         agent._load_memory()
         logger.info(
-            "Агент «%s» [%s] восстановлен: %d обращений, %d сообщ. в памяти из %d в истории, "
-            "суммаризация №%d заменяет %d сообщ., ждут суммаризации %d",
-            agent.profile.name, agent.id, agent.turns, len(agent._memory), agent.history_size,
-            agent._summary.version, agent._summary.messages, len(agent._pending),
+            "Агент «%s» [%s] восстановлен: %d обращений, ветка «%s», %d сообщ. в памяти из %d в истории, "
+            "стратегия %s, сжатие %s, суммаризация №%d заменяет %d сообщ., фактов %d, "
+            "ждут суммаризации %d, ждут фактов %d",
+            agent.profile.name, agent.id, agent.turns, agent._branch["name"], len(agent._memory),
+            agent.history_size, agent.strategy, "вкл" if agent.summarize else "выкл",
+            agent._summary.version, agent._summary.messages, len(agent._facts.items),
+            len(agent._pending_summary), len(agent._pending_facts),
         )
         return agent
 
@@ -1334,39 +1773,41 @@ class Agent:
 
     @property
     def history_size(self) -> int:
-        """Сколько сообщений агента лежит в истории (в памяти — обычно меньше)."""
-        return self.store.count(self.id) if self.store is not None else len(self._memory)
+        """Сколько сообщений активной ветки лежит в истории (в памяти — обычно меньше)."""
+        return self.store.count(self.id, self.branch) if self.store is not None else len(self._memory)
 
     def transcript(self) -> list[dict]:
-        """Вся переписка агента: из истории, если она есть, иначе из памяти.
+        """Вся переписка активной ветки: из истории, если она есть, иначе из памяти.
 
         Интерфейс рисует ленту именно отсюда, поэтому после перезапуска на экране
         оказывается весь прошлый разговор, а не только то, что уйдёт в модель.
         """
         if self.store is not None:
-            return self.store.messages(self.id)
+            return self.store.messages(self.id, self.branch)
         return self.memory
 
     def tokens_state(self) -> dict:
         """Во что обойдётся следующий запрос и сколько уже потрачено за всё время.
 
-        Считается до всякого вызова: инструкция, окно памяти и схемы инструментов
-        уже известны, а значит известен и вес контекста. Интерфейс показывает это
-        полосой — видно, как разговор занимает окно модели и из чего он состоит.
-        Отдельно считается ВСЯ переписка на диске: обычно она заметно больше
-        контекста, и разница между «сохранено» и «уходит в модель» — это и есть
-        цена памяти.
+        Считается до всякого вызова: инструкция, блоки стратегии, окно памяти и
+        схемы инструментов уже известны, а значит известен и вес контекста.
+        Интерфейс показывает это полосой — видно, как разговор занимает окно
+        модели и из чего он состоит. Отдельно считается ВСЯ переписка на диске:
+        обычно она заметно больше контекста, и разница между «сохранено» и
+        «уходит в модель» — это и есть цена памяти.
         """
         specs = tools.specs() if self.tools_enabled else None
-        block = self._summary_block()
+        summary_block = self._summary_block()
+        facts_block = self._facts_block()
         breakdown = tokens.measure(
-            self._system_prompt([]), self._memory, "", specs, self.model, summary=block
+            self._system_prompt([]), self._memory, "", specs, self.model,
+            summary=summary_block, facts=facts_block,
         )
         limit = self._context_limit()
         history = self.transcript()
         fix = tokens.calibration(self.model)
-        folded = self._summary.tokens if block else 0
-        pending_tokens = tokens.measure_messages(self._pending, self.model)
+        folded = self._summary.tokens if summary_block else 0
+        beyond, beyond_tokens = self._beyond_window(history)
         return {
             "model": self.model,
             "breakdown": breakdown.to_dict(),
@@ -1387,23 +1828,40 @@ class Agent:
                 "last_actual": fix.last_actual,
             },
             "spent": self.spent(),
-            # Сжатие: что заменяет суммаризация, что ждёт очереди и сколько весил бы тот
-            # же запрос без сжатия — свёрнутые и ждущие сообщения как есть.
-            "compression": self.compression,
+            # Стратегия и сжатие: что заменяют их блоки, что ждёт очередей, что осталось
+            # за окном и сколько весил бы тот же запрос с полной историей как есть.
+            "strategy": self.strategy,
+            "strategy_label": config.strategy_label(self.strategy),
+            "strategy_en": config.strategy_en(self.strategy),
+            "summarize": self.summarize,
+            "branch": self.branch,
+            "branch_name": self._branch["name"],
+            "branch_origin": self._branch["origin"],
+            "branch_shared": self._branch["shared"],
             "summary_every": self.summary_every,
             "summary": self._summary.to_dict(),
-            "summary_active": bool(block),
+            "summary_active": bool(summary_block),
             "summary_tokens": breakdown.summary,
-            "folded_messages": self._summary.messages if block else 0,
+            "folded_messages": self._summary.messages if summary_block else 0,
             "folded_tokens": folded,
-            "pending_messages": len(self._pending),
-            "pending_tokens": pending_tokens,
-            "uncompressed": breakdown.total - breakdown.summary + folded + pending_tokens,
+            "facts": self._facts.to_dict(),
+            "facts_active": bool(facts_block),
+            "facts_tokens": breakdown.facts,
+            "facts_pending": len(self._pending_facts),
+            "pending_messages": len(self._pending_summary),
+            "pending_tokens": tokens.measure_messages(self._pending_summary, self.model),
+            "dropped_messages": beyond,
+            "dropped_tokens": beyond_tokens,
+            "uncompressed": breakdown.total - breakdown.summary - breakdown.facts + folded + beyond_tokens,
         }
 
     def summaries(self) -> list[dict]:
-        """Все версии суммаризации из хранилища: как она росла вместе с разговором."""
-        return self.store.summaries(self.id) if self.store is not None else []
+        """Все версии суммаризации активной ветки: как она росла вместе с разговором."""
+        return self.store.summaries(self.id, self.branch) if self.store is not None else []
+
+    def facts_versions(self) -> list[dict]:
+        """Все версии блока фактов активной ветки."""
+        return self.store.facts_versions(self.id, self.branch) if self.store is not None else []
 
     def spent(self) -> dict:
         """Итог по расходу токенов за всё время жизни агента (из хранилища)."""
@@ -1436,17 +1894,27 @@ class Agent:
             "tools_enabled": self.tools_enabled,
             "planning": self.planning,
             "max_steps": self.max_steps,
-            "compression": self.compression,
+            "strategy": self.strategy,
+            "strategy_label": config.strategy_label(self.strategy),
+            "strategy_en": config.strategy_en(self.strategy),
+            "summarize": self.summarize,
             "summary_every": self.summary_every,
             "summary": self._summary.to_dict(),
             "summary_active": bool(self._summary_block()),
-            "pending_messages": len(self._pending),
+            "facts": self._facts.to_dict(),
+            "facts_active": bool(self._facts_block()),
+            "facts_pending": len(self._pending_facts),
+            "pending_messages": len(self._pending_summary),
+            "branch": self.branch,
+            "branch_name": self._branch["name"],
+            "branch_origin": self._branch["origin"],
+            "branch_shared": self._branch["shared"],
             "tools": tools.catalog(),
             "workspace": str(tools.workspace()),
             # Память между запусками: сколько сохранено, где лежит и когда говорили
             "history_messages": self.history_size,
             "history_file": str(self.store.path) if self.store is not None else None,
-            "last_seen_at": self.store.last_at(self.id) if self.store is not None else None,
+            "last_seen_at": self.store.last_at(self.id, self.branch) if self.store is not None else None,
             "restored": self.restored,
         }
 
@@ -1472,6 +1940,28 @@ def load_agents(store: Store | None = None) -> tuple[list[Agent], Agent]:
     return agents, active
 
 
+def _strategy_and_summarize(settings: dict) -> tuple[str, bool]:
+    """Стратегия и сжатие из сохранённых настроек, с оглядкой на прошлые версии базы.
+
+    Настройка `summarize` появилась, когда суммаризация перестала быть стратегией и
+    стала опцией поверх любой из них. Пока её в базе нет (None — колонку только что
+    дописали), значение выводим из того, что там лежало: в базе прошлой версии
+    суммаризация была одним из положений переключателя стратегий, а ещё раньше —
+    отдельным тумблером `compression`. Поведение агента от этого не меняется: он
+    продолжает делать то же, что делал до обновления.
+    """
+    strategy = settings.get("strategy") or ""
+    summarize = settings.get("summarize")
+    if summarize is None:
+        summarize = (strategy == "summary") if strategy else settings.get("compression", True)
+    if strategy in ("summary", ""):
+        strategy = "window"   # суммаризация поверх скользящего окна — это она и была
+    if strategy not in config.STRATEGY_BY_CODE:
+        logger.warning("В истории стратегия «%s» неизвестна — берём %s", strategy, config.AGENT_STRATEGY)
+        strategy = config.AGENT_STRATEGY
+    return strategy, bool(summarize)
+
+
 def _extract_json(text: str) -> dict | None:
     """Достать JSON из ответа модели (на случай ```-обрамления или текста вокруг)."""
     text = (text or "").strip()
@@ -1490,6 +1980,33 @@ def _extract_json(text: str) -> dict | None:
             except json.JSONDecodeError:
                 return None
         return None
+
+
+def _parse_facts(text: str) -> dict[str, str] | None:
+    """Разобрать блок фактов из ответа модели: {"facts": {...}} или просто объект.
+
+    Значения приводятся к коротким строкам, пустые ключи и значения отбрасываются,
+    лишнее сверх потолка отрезается. None — если это вообще не JSON-объект.
+    """
+    data = _extract_json(text)
+    if isinstance(data, dict) and isinstance(data.get("facts"), dict):
+        data = data["facts"]
+    if not isinstance(data, dict):
+        return None
+    items: dict[str, str] = {}
+    for key, value in data.items():
+        name = " ".join(str(key).split()).strip(" :-")[:60]
+        if isinstance(value, (list, dict)):
+            value = json.dumps(value, ensure_ascii=False)
+        text_value = " ".join(str(value).split())[:200] if value is not None else ""
+        if name and text_value:
+            items[name] = text_value
+    return dict(list(items.items())[:config.FACTS_LIMIT])
+
+
+def _clean_name(name: str) -> str:
+    """Имя ветки или точки: одна строка без лишних пробелов, не длиннее NAME_MAX."""
+    return " ".join((name or "").split())[:NAME_MAX]
 
 
 def _short(value: object, limit: int = 60) -> str:
